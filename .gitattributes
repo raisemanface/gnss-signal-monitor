@@ -1,0 +1,9 @@
+# 统一换行符，避免 Windows / macOS 来回提交产生整文件 diff
+* text=auto eol=lf
+
+# 固件产物按二进制处理
+*.bin binary
+*.exe binary
+
+# 中文文档不参与 diff 的文本统计噪音
+*.md text
