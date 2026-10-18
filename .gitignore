@@ -1,0 +1,25 @@
+# 构建产物
+# 源码目录里那份 build/ 不进仓库；firmware/prebuilt/ 是特意保留的免编译包
+build/
+*.elf
+*.map
+*.merged.bin
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地工具（体积大且平台相关，文档里说明自行下载）
+esptool.exe
+
+# 串口日志
+*.log
