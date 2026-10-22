@@ -4,7 +4,7 @@
 //  一台"看得见状态翻转"的桌面验证台架,不是产品样机。
 //
 //  硬件:ESP32-S3 开发板(用板载 WS2812 彩色灯) + ATGM336H-5N + 2.4" ILI9341 触摸屏
-//        + SHT30-D 温湿度(I2C:SCL=GPIO7 / SDA=GPIO8,走核心自带的 Wire,不用装库)
+//        + SHT30-D 温湿度(I2C:SCL=GPIO9 / SDA=GPIO8,走核心自带的 Wire,不用装库)
 //          ★ 屏的 BLK 本项目直接接 3.3V 常亮,不占 IO —— GPIO7 就是这么空出来的
 //  环境:Arduino IDE,开发板选 "ESP32S3 Dev Module",库只装 TFT_eSPI
 //        板载彩灯走 Arduino-ESP32 核心内置函数,不用再装 Adafruit NeoPixel
@@ -109,12 +109,14 @@
 //    docs/变更记录-S3.md —— 文件头只留**现在有效**的口径,历史过程不再堆这里。
 // ----------------------------------------------------------------------------
 //  ★★ 现行口径(改代码前先读这一段)★★
-//   ① **与 C3 的链路走 `UART2(Serial2)`**,脚位 **GPIO44(RX) / GPIO43(TX)**
-//      (芯片官方 `U0RXD`/`U0TXD`),与 C3 的 GPIO20/21 配对。
-//      ⚠ **不能用 `Serial1`** —— 那是 UART1,被 GNSS 模块的 `port(1)` 占着(16/17):
+//   ① **与 C3 的链路走 `UART2(Serial2)`**,脚位 **GPIO39(RX) / GPIO40(TX)**
+//      (2026-10-22 官方重排:U0 那对 43/44 让还给板载转串口芯片,J3-9/J3-8 相邻),
+//      与 C3 的 GPIO20/21 配对。
+//      ⚠ **不能用 `Serial1`** —— 那是 UART1,被 GNSS 模块的 `port(1)` 占着(17/18):
 //        换脚会让 GNSS 收不到数据、C3 的命令被 gnss::poll() 当 NMEA 吃掉(v1.5.11 踩过)。
-//      ⚠ 43/44 曾被判"被板载 CP2102N 顶着、做不了" —— **该结论已推翻**(真因是面包板
-//        孔松);38/39 那段历史一并作废,别再照旧注释接线。
+//      ⚠ 沿革:43/44 曾被判"被板载 CP2102N 顶着、做不了"(已推翻,真因是面包板孔松),
+//        v1.5.23~v1.10.2 曾用回 43/44;2026-10-22 官方重排**主动让出**(不再与 USB 桥
+//        共享),38/39 那段更早的历史一并作废,别再照旧注释接线。
 //   ② **链路协议**:收 `@k <payload>`、回 `@s ok <payload>`。S3 只认 `@k ` 前缀;
 //      收到后取**首字符**交给 `consoleKey()` —— 与电脑串口**同一份分派**(链路侧有
 //      白名单 `linkKeyAllowed()`,新增可远程触发的命令要同步登记,见 benchlink::poll)。
@@ -210,14 +212,14 @@
 // ============================================================================
 
 // ---------------- 引脚 ----------------
-// 接法(2026-09-30 接真模块,按用户实物接线):
-//   模块 TXD --> ESP32 GPIO16 (RX1)   模块 RXD --> ESP32 GPIO17 (TX1)
-//   模块 PPS --> ESP32 GPIO18         模块 VCC/GND 另接
+// 接法(2026-10-22 官方重排:落芯片官方 UART1 焊盘 U1RXD=18 / U1TXD=17;沿革 09-30~10-21 用 16/17):
+//   模块 TXD --> ESP32 GPIO18 (U1RXD)   模块 RXD --> ESP32 GPIO17 (U1TXD)
+//   模块 PPS --> ESP32 GPIO16           模块 VCC/GND 另接
 // ★ 交叉接线:模块的"发"接芯片的"收"。名字容易绕,以"信号流"为准:
-//   GPS 数据流方向  TXD(模块) ──> GPIO16 ──> UART 接收
-constexpr int PIN_GNSS_RX    = 16;   // ESP32-S3 RX1  <-- 模块 TXD
-constexpr int PIN_GNSS_TX    = 17;   // ESP32-S3 TX1  --> 模块 RXD(只收不发可不接)
-constexpr int PIN_GNSS_PPS   = 18;   // 模块 PPS(1Hz 秒脉冲) --> 用于校时/驯服,见 pps 段
+//   GPS 数据流方向  TXD(模块) ──> GPIO18 ──> UART1 接收
+constexpr int PIN_GNSS_RX    = 18;   // ESP32-S3 U1RXD(官方焊盘,J1-11) <-- 模块 TXD
+constexpr int PIN_GNSS_TX    = 17;   // ESP32-S3 U1TXD(官方焊盘,J1-10) --> 模块 RXD(只收不发可不接)
+constexpr int PIN_GNSS_PPS   = 16;   // 模块 PPS(1Hz 秒脉冲) --> 用于校时/驯服,见 pps 段
 
 // ---- 屏幕 ----
 // ★ 这里不写死脚号,直接引用 User_Setup.h 里的宏(已随上面的 <TFT_eSPI.h> include 进来)。
@@ -236,8 +238,9 @@ constexpr int PIN_GNSS_PPS   = 18;   // 模块 PPS(1Hz 秒脉冲) --> 用于校�
 
 // ---- 背光 ----
 // ★ 本项目实测:屏的 BLK 直接接 3.3V 常亮,**不占 IO**,所以默认不驱动任何脚。
-//   这份引脚表是从另一个项目沿用的,那边背光走 GPIO7;本项目 GPIO7 空着,
-//   已经给下面的 SHT30 当 I2C 的 SCL —— 哪天改成 GPIO 控背光,务必先看这条冲突。
+//   这份引脚表是从另一个项目沿用的,那边背光走 GPIO7。2026-10-22 官方重排后
+//   SHT30 的 SCL 挪到 GPIO9(官方 Wire 默认对),GPIO7 彻底空闲 —— 哪天改成
+//   GPIO 控背光,把 BLK 挂到 7 是现成的候选(仍要先查与台架其它线不冲突)。
 #define TFT_BL_ON_GPIO    0          // 1=背光由 GPIO 控制(需在 User_Setup 里定义 TFT_BL)
                                      // 0=背光直连 3.3V 常亮(本项目)
 #if TFT_BL_ON_GPIO
@@ -251,14 +254,17 @@ constexpr int PIN_GNSS_PPS   = 18;   // 模块 PPS(1Hz 秒脉冲) --> 用于校�
 
 // ---- SHT30-D 数字温湿度(I2C) ----
 // 驱动走 ESP32 核心自带的 Wire,**不用装任何库**。
-// 接线:VCC->3.3V   GND->GND   SCL->GPIO7   SDA->GPIO8
+// 接线:VCC->3.3V   GND->GND   SCL->GPIO9   SDA->GPIO8
+//      (2026-10-22 官方重排:SDA=8/SCL=9 正是 Arduino-ESP32 S3 的 Wire 默认对;
+//       沿革 09-30~10-21 SCL 在 GPIO7)
 // 市面上卖的基本都是模块,板上已带 4.7k 上拉;若是裸芯片,SDA/SCL 各要一只 4.7k 上拉到 3.3V。
-constexpr int PIN_SHT_SCL    =  7;
+constexpr int PIN_SHT_SCL    =  9;
 constexpr int PIN_SHT_SDA    =  8;
 
 // ---- 触摸(XPT2046,屏上直接点,省得敲笔记本) ----
 // 片选 TOUCH_CS / 中断 TOUCH_PEN 由 User_Setup 定义、TFT_eSPI 自己用,固件不碰,故不在这里重列。
-// 当前接线:T_CS=GPIO9,T_IRQ=GPIO5(轮询方式,不接也行)。
+// 当前接线:T_CS=GPIO14(官方 FSPIWP 焊盘,与屏的 SPI 集群 J1-16..20 连成一排),
+//          T_IRQ=GPIO5(轮询方式,不接也行)。沿革 09-30~10-21 T_CS=GPIO9(已让给 I2C SCL)。
 // 注意:这个开关必须是宏(#define),不能用 constexpr —— 下面要拿它做 #if 判断。
 #define ENABLE_TOUCH  1              // 1=开触屏控制  0=只用串口命令
 
@@ -277,7 +283,7 @@ static_assert(TFT_SCLK == 12 && TFT_MOSI == 11 && TFT_MISO == 13 &&
 #if ENABLE_TOUCH && !defined(TOUCH_CS)
 #error "ENABLE_TOUCH=1,但 User_Setup 里没有 #define TOUCH_CS —— 触摸驱动根本没编进来。要么在 User_Setup 里打开 TOUCH_CS,要么把 ENABLE_TOUCH 改成 0。"
 #elif ENABLE_TOUCH
-static_assert(TOUCH_CS == 9, "触摸片选不是 GPIO9 —— 与台架接线不符,同上,先检查 User_Setup 挂对没有。");
+static_assert(TOUCH_CS == 14, "触摸片选不是 GPIO14 —— 与台架接线(2026-10-22 官方重排)不符,先检查 User_Setup 挂对没有。");
 #endif
 
 #if TFT_BL_ON_GPIO && defined(TFT_BL)
@@ -288,13 +294,13 @@ static_assert(TFT_BL != PIN_SHT_SCL,
 
 // PPS 是中断输入脚,和 I2C 的两条线不能撞(撞了秒脉冲会打断 I2C 时序,读数开始随机失败)。
 static_assert(PIN_GNSS_PPS != PIN_SHT_SCL && PIN_GNSS_PPS != PIN_SHT_SDA,
-              "PPS 脚和 SHT30 的 I2C 线(SCL=7 / SDA=8)撞了 —— 秒脉冲会打乱 I2C 时序。换个脚接 PPS。");
+              "PPS 脚和 SHT30 的 I2C 线(SCL=9 / SDA=8)撞了 —— 秒脉冲会打乱 I2C 时序。换个脚接 PPS。");
 
 // ---------------- 板载 WS2812 彩色灯 ----------------
 // ★ 先纠正一个常见误解:板载彩灯**是占一个 GPIO 的**,不是"不占 IO"。
 //    它是 WS2812(单总线可寻址灯),数据线必须挂到一个脚上:
-//      官方 ESP32-S3-DevKitC-1  v1.1 → GPIO48
-//      官方 ESP32-S3-DevKitC-1  v1.0 → GPIO38
+//      官方 ESP32-S3-DevKitC-1  v1.0 → GPIO48(乐鑫官方用户手册口径)
+//      官方 ESP32-S3-DevKitC-1  v1.1 → GPIO38(同上;★ 2026-10-22 对照官方手册纠正 —— 原来这两行写反了)
 //      国产 N16R8 / 克隆板常见        → GPIO48(也有 38 / 21 / 47)
 //    "板载"只代表不用外接线,不代表不花脚位。好在你台架的脚位表里没有 48,等于白捡。
 //
@@ -302,7 +308,8 @@ static_assert(PIN_GNSS_PPS != PIN_SHT_SCL && PIN_GNSS_PPS != PIN_SHT_SDA,
 //    要用锡短接后才连到 GPIO48(少数板子出厂已短接)。没短接的表现是:
 //    程序烧录正常、屏也正常,就是灯不亮 —— 别怀疑代码,先看那对焊盘。
 //
-// 灯的实际脚位本项目**已经查清**:本板是 ESP32-S3-DevKitC-1 v1.1 → **GPIO48**,
+// 灯的实际脚位本项目**已经查清**:本板实测灯亮在 **GPIO48**(2026-09-28 实测)
+// ⇒ 按官方口径这块板是 **v1.0**(v1.1 的灯在 38;板丝印版本待核,2026-10-22 标注),
 // 代码里就是 LED_RGB_PIN = 48。以前那条 'l' 试灯命令(v1.5.10 已删)是当初"不知道
 // 灯在哪"时的临时手段,现在脚位是已知事实,不再需要。若哪天换了板子要重新找,
 // 若颜色反了(该显红却显绿),说明这颗灯的色序不是 GRB,见下面 led::writePix 里的注释。
@@ -805,7 +812,7 @@ inline const char* recent(int back) {
 }  // namespace gnss
 
 // ============================================================================
-//  第 1.2 段:PPS 秒脉冲捕获(模块 PPS --> GPIO18,上升沿中断)
+//  第 1.2 段:PPS 秒脉冲捕获(模块 PPS --> GPIO16,上升沿中断)
 //  PPS = Pulse Per Second:模块定位后,每秒在 PPS 脚上打一个上升沿,该沿的
 //  时刻就是"整秒"的硬件基准(精度是 GPS 级的,比板载晶振好几个数量级)。
 //
@@ -923,7 +930,7 @@ inline void report() {
   interrupts();
 
   if (cnt == 0) {
-    Serial.println("[bench] pps: 尚无脉冲 —— 检查 PPS 是否接到 GPIO18;"
+    Serial.println("[bench] pps: 尚无脉冲 —— 检查 PPS 是否接到 GPIO16;"
                    "另注意多数模块未定位时 PPS 不出脉冲(等定位转绿再看)");
     return;
   }
@@ -5929,7 +5936,12 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      不是 bug;要看短时抖动请回放串口状态行。
 //   ③ 协议 **P2 不变**:evth 的 <nHave> 发的是 `%lu`、C3 用 `int` 收,
 //      evtr 的 <seq> 也是 `%lu`;页码/滚动全是 int ⇒ **C3 一行不用改、不用重烧**。
-constexpr const char* kVer   = "v1.10.2";
+//
+//   ★ v1.10.3(2026-10-22):**引脚官方重排** —— 屏 SPI 落官方 FSPI 焊盘(不变)、
+//      T_CS 9→14(FSPIWP)、I2C SCL 7→9(官方 Wire 默认对 8/9)、GNSS 换官方 U1
+//      焊盘(模块TXD 16→18,PPS 18→16)、链路 44/43→39/40(把 U0 还给板载 USB 桥)。
+//      判据 / 协议 / NVS / 界面**一行未动**;需按 docs/接线表 v2.2 重新落线。
+constexpr const char* kVer   = "v1.10.3";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -6062,11 +6074,16 @@ inline void run() {
 
 // ============================================================================
 //  台架链路 benchlink:C3 命令板 ←→ S3 台架 的串口通道
-//  (v1.5.10 新增 / v1.5.11 改 UART2 / v1.5.12 换脚到 38/39 / v1.5.23 换回 44/43)
+//  (v1.5.10 新增 / v1.5.11 改 UART2 / v1.5.12 换脚到 38/39 / v1.5.23 换回 44/43 /
+//   2026-10-22 官方重排换到 39/40,把 43/44 还给板载 USB 桥)
 // ----------------------------------------------------------------------------
-//  物理:v1.5.23 起接 **GPIO44(RX) / GPIO43(TX)** —— 即 S3 芯片**官方 UART0 那对**
-//        (U0RXD=44 / U0TXD=43),与 C3 侧的原生 **GPIO20(RX)/GPIO21(TX)** 正好配对。
-//        接线:`C3 GPIO20 ← S3 GPIO43`、`C3 GPIO21 → S3 GPIO44`、GND 共地。
+//  物理:2026-10-22(v1.10.3)起接 **GPIO39(RX) / GPIO40(TX)** —— J3-9/J3-8 相邻。
+//        ★ 官方重排的动机:DevKitC-1 的 **Micro-USB 口经板载转串口芯片接 U0
+//          (U0TXD=43 / U0RXD=44)** —— 链路占着 43/44 就等于与 USB 桥共享两条线
+//          (和 C3 新板 CH340K 占 GPIO20/21 是同一格局)。挪到 39/40 后,
+//          U0 整个还给桥片,Micro-USB 口随时可当第二烧录/控制台,互不打架。
+//        C3 侧仍是原生 **GPIO20(RX)/GPIO21(TX)** 配对。
+//        接线:`C3 GPIO20 ← S3 GPIO40`、`C3 GPIO21 → S3 GPIO39`、GND 共地。
 //        ★ ★ 为什么绕了一圈才用上(这段沿革别删,免得日后再判错):
 //          v1.5.12 曾把这对脚判为"做不了":本板是 **ESP32-S3-DevKitC-1 v1.1**,
 //          "UART 口"的桥片 **CP2102N 挂在 GPIO43/44** 上;当时(2026-10-11 17:2x)
@@ -6075,6 +6092,8 @@ inline void run() {
 //          ★★ **2026-10-15 20:5x 复盘推翻**:那次不通的真因是**面包板孔松**
 //          (同一轮里 C3 那侧的 21 脚孔也是松的,用户已改成焊线)。
 //          ⇒ 官方 43/44 恢复使用,与 C3 的 20/21 对齐。
+//          (★ 2026-10-22 又**主动让出** 43/44 —— 不是它们不能用,而是官方重排要把
+//          U0 还给板载 USB 桥;见段头。)
 //          ⚠ 保留的物理前提:C3↔S3 这三根必须**焊死(或可靠插接)**;日后若再
 //          "时好时坏",先拿万用表量两端通断,再怀疑芯片/固件(见 docs/接线表 §六)。
 //        (v1.5.12~v1.5.22 用的是 38/39:36/37 带八线 PSRAM 的模块上会与 PSRAM 复用
@@ -6110,32 +6129,34 @@ static void consoleKey(char c);            // 定义在本段之后,先声明
 
 namespace benchlink {
 
-constexpr int      PIN_RX   = 44;          // ★ v1.5.23 换回官方 U0RXD:S3 收 ← C3 GPIO21(TX)
-constexpr int      PIN_TX   = 43;          //   官方 U0TXD:S3 发 → C3 GPIO20(RX)。沿革见段头。
+constexpr int      PIN_RX   = 39;          // ★ 2026-10-22 官方重排:S3 收 ← C3 GPIO21(TX)。沿革见段头
+constexpr int      PIN_TX   = 40;          //   S3 发 → C3 GPIO20(RX)。J3-9/J3-8 相邻。
 constexpr uint32_t kBaud    = 115200;
 constexpr int      kLineMax = 176;         // 最长上行:"@k wadd " + 32(ssid) + 1 + 64(pass)
 
 // 编译期守住 ①:链路脚不能撞台架任何一条已用线(否则现场会变成"时好时坏"的玄学故障)
-static_assert(PIN_RX != 4 && PIN_RX != 6 && PIN_RX != 7 && PIN_RX != 8 &&
-              PIN_RX != 9 && PIN_RX != 10 && PIN_RX != 11 && PIN_RX != 12 &&
-              PIN_RX != 13 && PIN_RX != 16 && PIN_RX != 17 && PIN_RX != 18 &&
-              PIN_TX != 4 && PIN_TX != 6 && PIN_TX != 7 && PIN_TX != 8 &&
-              PIN_TX != 9 && PIN_TX != 10 && PIN_TX != 11 && PIN_TX != 12 &&
-              PIN_TX != 13 && PIN_TX != 16 && PIN_TX != 17 && PIN_TX != 18 &&
+static_assert(PIN_RX != 4 && PIN_RX != 6 && PIN_RX != 8 && PIN_RX != 9 &&
+              PIN_RX != 10 && PIN_RX != 11 && PIN_RX != 12 && PIN_RX != 13 &&
+              PIN_RX != 14 && PIN_RX != 16 && PIN_RX != 17 && PIN_RX != 18 &&
+              PIN_TX != 4 && PIN_TX != 6 && PIN_TX != 8 && PIN_TX != 9 &&
+              PIN_TX != 10 && PIN_TX != 11 && PIN_TX != 12 && PIN_TX != 13 &&
+              PIN_TX != 14 && PIN_TX != 16 && PIN_TX != 17 && PIN_TX != 18 &&
               PIN_RX != PIN_TX,
-              "链路脚撞了台架已用线(屏 4/6/10/11/12/13、触摸 9、I2C 7/8、GNSS 16/17/18)—— 换一对脚。");
+              "链路脚撞了台架已用线(屏 4/6/10/11/12/13、触摸 14、I2C 8/9、GNSS 16/17/18)—— 换一对脚。");
 
 // 编译期守住 ②:链路脚不能踩板子/内核的保留脚 —— 这些脚接上去必然"时好时坏":
 //   19/20 = 芯片原生 USB(本工程的电脑串口);26..32 = SPI flash;33..37 = 八线 PSRAM(若模块带);
 //   48 = 板载 WS2812。
-//   ★ v1.5.23(2026-10-15 20:5x):**43/44 已从本表移出** —— 它是官方 U0TXD/U0RXD,
-//     当年(2026-10-11)被判"CP2102N 顶牛、做不了",2026-10-15 复盘推翻该结论:
-//     那次不通的真因是**面包板孔松**(用户已改焊线)。现恢复使用,见段头说明。
+//   ★ v1.5.23(2026-10-15 20:5x):**43/44 曾从本表移出**(沿革见段头)。
+//   ★ 2026-10-22 官方重排:**43/44 重新入表** —— 它们是官方 U0TXD/U0RXD,板上接着
+//     USB 转串口芯片(Micro-USB 口),链路不该再与它共享;顺便把当年"CP2102N 顶牛"
+//     的旧账说清:不是不能用,是不该和桥片共享。
 constexpr bool linkPinReserved(int p) {
-  return p == 19 || p == 20 || p == 48 || (p >= 26 && p <= 37);
+  return p == 19 || p == 20 || p == 43 || p == 44 || p == 48 ||
+         (p >= 26 && p <= 37);
 }
 static_assert(!linkPinReserved(PIN_RX) && !linkPinReserved(PIN_TX),
-              "链路脚踩到保留脚了(USB 19/20、flash 26-32、PSRAM 33-37、灯 48)—— 换一对脚。");
+              "链路脚踩到保留脚了(USB 19/20、UART 桥 43/44、flash 26-32、PSRAM 33-37、灯 48)—— 换一对脚。");
 
 static char     line[kLineMax];
 static int      n        = 0;
@@ -6707,7 +6728,7 @@ void setup() {
   eventlog::begin();        // ★ v1.7.0:载入事件池 + 统计累加器(gnsevt)
 
   gnss::begin();
-  pps::begin();             // PPS 秒脉冲中断(GPIO18)。只挂中断,不占主循环时间
+  pps::begin();             // PPS 秒脉冲中断(GPIO16)。只挂中断,不占主循环时间
 
   // ---- 时基体检:本机 RTC 慢时钟到底用的哪个源 ----
   // 内部 RC(~136kHz) 还是 外挂 32.768k 晶振,相差 4 倍,一读就分清。
@@ -6736,11 +6757,12 @@ void setup() {
   disp::begin();
   led::begin();
   sht::begin();             // I2C 温湿度。必须排在 disp::begin() 之后 ——
-                            // 屏初始化时可能去动 GPIO7,让 I2C 在其后拿回这条线的控制权
+                            // 屏/触摸初始化时 TFT_eSPI 会把自己配置的脚(TOUCH_CS=14 等)
+                            // 过一遍,I2C 在其后 begin,拿回自己两条线的控制权
   touch::begin();           // 必须在 disp::begin() 之后 —— 它要用 tft
 
   wifi10::begin();          // ★ v1.5.17:读 NVS 台账 -> 先异步扫 -> 只连"范围内 ∧ 已存档"里最强的
-  benchlink::begin();       // v1.5.23:与 C3 命令板的串口链路(GPIO44=RX / GPIO43=TX,走 UART2)
+  benchlink::begin();       // v1.10.3:与 C3 命令板的串口链路(GPIO39=RX / GPIO40=TX,走 UART2;官方重排)
   splash::run();            // v1.5.6:开机动画 + 自检(内部自己等 GNSS 首报文,最多 3s)
 
   // ★ v1.6.0:开局自报协议号 —— 与 C3 的 `[c3] proto P1` 对称,排障时(尤其

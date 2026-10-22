@@ -83,7 +83,7 @@
 // 想用触屏就保留下面这两行;不想用就注释掉,同时把固件里 ENABLE_TOUCH 改 0。
 // 两个开关必须一致,不一致会在编译时报 #error 提醒。
 #define XPT2046_Touchscreen       // 打开触摸控制器支持(TFT_eSPI 里就叫这个名字)
-#define TOUCH_CS   9              // GPIO9 - 触摸片选 T_CS
+#define TOUCH_CS   14             // GPIO14 - 触摸片选 T_CS(2026-10-22 官方重排:FSPIWP 焊盘;沿革 9)
 #define TOUCH_PEN  5              // GPIO5 - 触摸中断 T_IRQ(轮询方式不接也行)
 #define SPI_TOUCH_FREQUENCY 2500000   // XPT2046 上限约 2.5MHz,别往上调
 
