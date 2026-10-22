@@ -1188,7 +1188,15 @@ constexpr const char* kSub2  = "STUDIO";
 //   为什么合理:这一组下面就是 SET BASE / CLEAR BASE,组名叫 BASE 才对得上;而
 //   "JUDGE(判据)"是评测语境的说法,自用阶段没有再出现的必要。
 //   ⚠ 内部数组名 `kLv2_JUDGE` **保留不改**(纯符号,不上屏,改名只增 diff 不长功能)。
-constexpr const char* kVer   = "v1.2.5";
+// ★ v1.2.6(2026-10-22 晚,板载 RGB 呼吸灯 —— C3 换 DevKit 后 GPIO8 从"电平 LED"变"WS2812"):
+//   用户:"把它做成呼吸灯效果 青蓝色,用它来表示 UART 通信的节拍";断链行为拍板"变红"。
+//   ① 驱动改 `neopixelWrite()`(esp32 核心 3.3.8 内置,RMT 外设)—— **零新库依赖**,
+//     不走 Adafruit_NeoPixel;② 链路活 = 青蓝 RGB(0,160,255) 正弦呼吸,周期 2 s
+//     (与 `@k ping` 心跳同拍,接替当年 SuperMini 2s 明灭的角色);链路断 = 红常亮;
+//   ③ 旧「2 s 电平翻转」**删除**:WS2812 对普通高低电平不响应(这就是换板后灯从不亮的
+//     原因),且 digitalWrite 与 RMT 输出在同一个脚上打架;setup() 里 pinMode/digitalWrite(8)
+//     一并撤;④ 引脚 = GPIO8 是官方 DevKitM-1 口径(接线图 J3-6「IO8 板载 RGB」佐证)。
+constexpr const char* kVer   = "v1.2.6";
 
 constexpr uint32_t kExpandMs = 5000;    // 展开时间下限(与 S3 同)
 constexpr uint32_t kHoldMs   = 2000;    // 定格(与 S3 同)
@@ -4074,10 +4082,9 @@ void setup() {
                 (unsigned)(ESP.getFlashChipSize() / 1024), (unsigned)ESP.getPsramSize());
   Serial.printf("[c3] free heap @boot = %u\n", (unsigned)ESP.getFreeHeap());
 
-  // 板载 LED(GPIO8):★ v0.10 起**无条件**执行 —— 链路已离开 GPIO8(现为 20/21),
-  //   这只脚交还给 LED 做"程序在跑"的可视指示。原来的 `#if !LINK_PINS_89` 已随宏一起删。
-  pinMode(8, OUTPUT);
-  digitalWrite(8, HIGH);
+  // 板载 RGB(WS2812,GPIO8):★ v1.2.6 起由 loop() 里的 neopixelWrite() 协议驱动。
+  //   旧的 pinMode/digitalWrite(8) 在这里初始化电平 —— 对 WS2812 无效,且与 RMT 输出
+  //   在同一个脚上打架,已删。neopixelWrite() 自管引脚,无需 pinMode。
 
   tft.init();
   tft.setRotation(0);               // 竖屏,与 S3 主界面同向
@@ -4097,9 +4104,8 @@ void setup() {
   //   写死必漂 ⇒ 一律占位符。改完务必扫:
   //     grep -nE '"[^"]*v[01]\.[0-9]' firmware/*/*.ino
   //   除 kVer 与本行(已是 %s)外,应当只剩注释里的历史版本号。
-  Serial.printf("[c3] boot ok (%s: 一级菜单第一组已改名 **BASE**(v1.2.5,自用阶段不再讲\"判据\");"
-                "搬运页详情页左上角事件类型大字依赖 TFT_eSPI 的 LOAD_FONT4(已加编译期哨兵)。"
-                "协议 **P2**,与 S3 **v1.8.4** 配套)",
+  Serial.printf("[c3] boot ok (%s: 板载 RGB(GPIO8)呼吸灯 —— 链路活=青蓝呼吸 2s/断=红常亮,"
+                "neopixelWrite 内置 RMT 零新依赖);协议 **P2**(与 S3 同代)",
                 splash::kVer);
   Serial.println();
   printHelp();
@@ -4132,15 +4138,24 @@ void loop() {
                                                     //   这里是全局 loop(),不带会编译不过
   }
 
-  // 板载 LED 心跳:2 s 翻转(证明程序在跑)。
-  //   ★ v0.10:链路已离开 GPIO8(现为 20/21),这只脚**无条件**做 LED —— 原来的
-  //     `#if !LINK_PINS_89` 条件已随宏一起删掉。
-  static uint32_t tBlink = 0;
-  static bool ledOn = false;
-  if (millis() - tBlink >= 2000) {
-    tBlink = millis();
-    ledOn = !ledOn;
-    digitalWrite(8, ledOn ? HIGH : LOW);
+  // 板载 RGB 呼吸灯(★ v1.2.6):链路活 = 青蓝呼吸(周期 2 s,与上方 @k ping 同拍);
+  //   链路断 = 红常亮。20 ms 步进(50 fps 足够顺滑,RMT 负载可忽略)。
+  //   ★ lastOk 初值 true ⇒ 开机若链路未通,先亮一次红(与屏上 `--` 同刻出现),
+  //     首条合法回执把它切进青蓝呼吸。
+  static uint32_t tLed  = 0;
+  static bool     lastOk = true;
+  if (millis() - tLed >= 20) {
+    tLed  = millis();
+    bool ok = s3link::ok();
+    if (ok) {
+      // 正弦呼吸:0.05..1.0,cos 起止都在谷值,亮暗过渡自然无跳变
+      float ph = (float)(millis() % 2000) * 0.00031415927f;   // 2π / 2000ms
+      float s  = 0.05f + 0.95f * (0.5f - 0.5f * cosf(ph));
+      neopixelWrite(8, 0, (uint8_t)(160.0f * s), (uint8_t)(255.0f * s));
+    } else if (lastOk) {
+      neopixelWrite(8, 255, 0, 0);    // 刚断:只写一次红,之后保持
+    }
+    lastOk = ok;
   }
 
   delay(5);
