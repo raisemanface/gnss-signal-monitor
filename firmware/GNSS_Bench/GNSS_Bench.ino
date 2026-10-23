@@ -29,7 +29,7 @@
 //                    —— 原来那圈"顶部 100px 色带 + 全屏 3px 边框"v1.7.0 已删除
 //      y 240..273  按键条 —— 4 键等宽 60px:BASE / CLR-BS / CHARTS / LOG(★ v1.9.0 高 40->34)
 //      y 274..319  数据条 —— 左:FONT4 状态词(居中);右三行:HPL / CN0 / SAT(★ v1.9.0 40->46)
-//      ★ 报文窗**不再常驻**:在数据条上长按 ≥800ms 切出 8 行报文窗(再长按切回)
+//      ★ 报文窗**不再常驻**:在数据条上长按 ≥1s 切出 8 行报文窗(再长按切回;v1.10.6 取整)
 //      ★ 深色主题:页底 #0C0F13,卡面 / 面板 / 按键三级深灰,文字两级灰白 —— 一处常量定义全局引用
 //      ★ 全英文界面:内置 FONT4(Font32rle)是唯一含完整 96 ASCII 的大字模,
 //        原来的 32x32 中文字模(cnfont)v1.7.0 已整段删除(省 ~2.7KB flash + 2KB RAM)
@@ -62,9 +62,9 @@
 //          ★ v1.8.3:第 2 键原来叫 INJECT,**按住 5 s** 才生效(短按只打一行日志)——
 //            防误触。生效后该键亮绿,表示"当前没有基准"(与 BASE 的 SET 绿互斥:
 //            同一时刻只有一个键是绿的)。见 touch::poll / disp::btnState。
-//          ★ v1.10.0:第 3 键 CHARTS **按住 1.5 s → 参数页**(短按仍是第二界面)。
-//            进度条与 CLR-BS 同一套观感,但阈值只有 1.5 s —— 它不具破坏性。
-//          数据条 y 274..319 -> **长按 ≥800ms** 切报文窗 / 切回(短按无动作)
+//          ★ v1.10.6:第 3 键 CHARTS **按住 5 s → 参数页**(短按仍是第二界面);与 CLR-BS 统一。
+//            进度条与 CLR-BS 同一套观感,阈值也统一 5 s(用户定,一致性优先)。
+//          数据条 y 274..319 -> **长按 ≥1s** 切报文窗 / 切回(短按无动作;v1.10.6 取整)
 //          ★ v1.7.0 起**动作一律在"抬起"时执行** —— 只有抬起才能分辨"点击"与"滑动";
 //            旧版在"刚按下"时就动作,分不出滑动。
 //    串口  115200,输入单字符回车
@@ -584,12 +584,12 @@ inline void bump(int i, int dir, int mult) {
 //    按键 40 -> 34(省 6),数据条 40 -> 46(得 6),两者之和仍是 80 ——
 //    **底部 sprite 尺寸、报文窗 8 行、BOT_Y 全都不变**,所以这轮只动两个数。
 //    按键文字是 FONT2(16px),在 34px 格里内缩 2px = 30px 可用,16px 字居中后
-//    上下各留 7px;长按进度条从 BTN_H-9 挪到 BTN_H-7(=27),不再贴字底。
+//    上下各留 7px;★ v1.10.6 长按进度条挪到键内**顶部** y=4(手指不挡)。
 //    数据条从 40 涨到 46,右侧才放得下**三行** 8px(HPL / CN0 / SAT)。
 // 原来那套「顶部 100px 状态色带 + 四周 3px 彩框 + 报文窗 + 指标区」**整体作废**:
 // 状态色改由**星空图外圈 2px 光环**唯一承载(见 statusColor565),
 // 原先散在指标区的信息(时间/坐标/温湿度/漂移/HDOP)全部归位到四角块与数据条。
-// 报文窗不再常驻 —— 长按数据条 800ms 切出来(见 touch::poll)。
+// 报文窗不再常驻 —— 长按数据条 1s 切出来(v1.10.6 取整;见 touch::poll)。
 constexpr int SCR_W    = 240;
 constexpr int SCR_H    = 320;
 
@@ -639,7 +639,7 @@ static_assert(R_RING_IN - R_STAR >= 3, "圆盘与状态光环之间要留 2px �
 // ③ 按键条必须四等分正好铺满
 static_assert(BTN_W * 4 == SCR_W, "按键条必须四等分铺满 240px");
 
-// ---- 报文窗(★ v1.7.0:长按数据条 800ms 切出/收回)—— 占 y 240..319 整块 240x80 ----
+// ---- 报文窗(★ v1.7.0:长按数据条切出/收回,v1.10.6 起阈值 1s)—— 占 y 240..319 整块 240x80 ----
 constexpr int MSG_ROWS  = 8;      // 8 行 x 10px = 80
 constexpr int MSG_LH    = 10;     // 报文行高
 constexpr int MSG_CHARS = 38;     // 字体 1 每字符 6px -> 240px 内放 38 字符(228px)
@@ -852,12 +852,13 @@ static volatile uint32_t integSecs    = 0;      // 累计的"GNSS 秒数"(丢沿
 static volatile uint32_t integSkipped = 0;      // 整段作废的次数(间隔 >4s,判为断线/失锁)
 
 // 中断服务:越短越好 —— 只记时刻、算间隔,不做任何打印/浮点。
-// 注意不要加 IRAM_ATTR:它把函数搬到 IRAM,但函数里引用的这几个 static 变量在
-// DRAM,l32r 取址的字面量会落到 .literal 段后面 —— 链接期直接报
-// "dangerous relocation: l32r: literal placed after use",整个工程编译不过。
-// 保持默认(函数在 Flash)即可;本项目已无运行期 NVS 写入(基准改会话制),
-// 不存在"写 Flash 时中断被屏蔽"的场景。
-inline void onEdge() {
+// ★ v1.10.5(复核 O1):**必须 IRAM_ATTR** —— 写 flash(NVS 落盘:基准/参数/事件流水)
+//   期间 flash cache 被禁用,此瞬间 PPS 沿触发本中断,CPU 到 flash 取指令取不到,
+//   直接 panic。旧注释声称"本项目已无运行期 NVS 写入(基准改会话制)"——该前提
+//   v1.7.0(基准恢复落盘)/v1.10.0(参数落盘)/v1.8.x(事件落盘)起早已不成立。
+//   本 ISR 只摸 .bss 里的 static volatile 变量、无 flash 常量表,IRAM 化安全;
+//   当年"l32r literal placed after use"链接错与当时的写法有关,以本实现为准重试。
+void IRAM_ATTR onEdge() {
   uint32_t now = micros();
   if (lastEdgeUs) {
     uint32_t gap = now - lastEdgeUs;     // 无符号减法,天然处理 micros() 回绕
@@ -889,7 +890,9 @@ inline void onEdge() {
 }
 
 inline void begin() {
-  pinMode(PIN_GNSS_PPS, INPUT);          // 模块 PPS 是推挽输出,不用内部上拉
+  pinMode(PIN_GNSS_PPS, INPUT_PULLDOWN); // ★ v1.10.4(评审 S7):模块 PPS 是推挽输出,
+                                         //   弱下拉不影响它;但**拔线后**脚悬空,原来
+                                         //   裸 INPUT 会被噪声触发 ISR(edgeCount 空涨)。
   attachInterrupt(digitalPinToInterrupt(PIN_GNSS_PPS), onEdge, RISING);
 }
 
@@ -1143,8 +1146,18 @@ static void handleGGA(int n) {
   st.hdop     = (float)atof(fld[8]);
 
   if (st.quality > 0 && fld[2][0] && fld[4][0]) {
-    st.lat      = toDeg(fld[2], fld[3][0]);
-    st.lon      = toDeg(fld[4], fld[5][0]);
+    const double la = toDeg(fld[2], fld[3][0]);
+    const double lo = toDeg(fld[4], fld[5][0]);
+    // ★ v1.10.4(评审 S6):坐标范围校验 —— 异常报文(如 atof 吃到 "9999")原来会
+    //   照单全收,distM 出 inf/nan、屏上 "inf m"、判据乱跳。超界 = 当无效帧丢弃
+    //   (fixValid 不置位),与"字段为空"同路。限幅不是 clamp 成 90/180:那会造出
+    //   一个"看起来合法"的假坐标,丢弃才是诚实行为。
+    if (la < -90.0 || la > 90.0 || lo < -180.0 || lo > 180.0) {
+      st.fixValid = false;
+      return;
+    }
+    st.lat      = la;
+    st.lon      = lo;
     st.fixValid = true;
     st.fixMs    = millis();
   } else {
@@ -1739,8 +1752,21 @@ inline void update() {
 
   // 参与比对的坐标:**就是收到的真实坐标**(★ v1.8.3 起没有"注入偏移"这条岔路了,
   // 原来这里有一段 `if (inject && baseSet) { cmpLat = injLat; ... }`)
+  // ★ v1.10.4(评审 P1):**只在输入变化时重算** —— 坐标 1 Hz 才更新、基准更罕见变,
+  //   而本函数 loop 每圈都进;原来每圈白算一轮 double Haversine(4 次软件 sin/cos +
+  //   atan2,ESP32-S3 无 FP64 硬件)。缓存键 = (fixMs, 基准坐标),任一变化才重算;
+  //   **数值与原实现逐位一致**(不是换近似公式,判据口径不动)。
   float off = 0;
-  if (baseSet) off = distM(baseLat, baseLon, nmea::st.lat, nmea::st.lon);
+  if (baseSet) {
+    static uint32_t cFixMs = 0;
+    static double   cBLat = 0, cBLon = 0;
+    static float    cOff  = 0;
+    if (nmea::st.fixMs != cFixMs || baseLat != cBLat || baseLon != cBLon) {
+      cFixMs = nmea::st.fixMs; cBLat = baseLat; cBLon = baseLon;
+      cOff   = distM(baseLat, baseLon, nmea::st.lat, nmea::st.lon);
+    }
+    off = cOff;
+  }
 
   // ★ v1.9.0:推进三件套(完好性 / CUSUM / 多径)。内部自己限速到 1 Hz,
   //   所以放在这里每圈调用是安全的 —— 它的输入本来就只有 1 Hz 的 NMEA。
@@ -2349,7 +2375,7 @@ static TFT_eSPI tft;
 //     合计 153,600B(= 旧 charts 全屏 sprite 同量级);进 charts 时两块都释放(互斥纪律)。
 //  ③ **状态色不再铺整块**:改由星空图外圈 2px 光环承载(statusColor565 取色),
 //     LOST 只让那一圈 300ms 闪 —— 旧写法每 300ms 重铺 240x100 = 24,000px 色带,省 >95%。
-//  ④ **报文窗不再常驻**:长按数据条 800ms 把底部 240..319 整块换成 8 行报文(再长按切回)。
+//  ④ **报文窗不再常驻**:长按数据条 1s 把底部 240..319 整块换成 8 行报文(再长按切回)。
 //  旧的「顶部 100px 色带 + 四周 3px 彩框 + 指标区四格 + 顶部时钟/坐标条」整套作废。
 // ============================================================================
 
@@ -2708,18 +2734,22 @@ inline void paintSky() {
 // ★ v1.8.3:CLR-BS 长按进度(touch::poll 写,btnState/paintBot 读)。
 //   0 = 没在按;1..7 = 按住计时档,每档约 714 ms,满 5 s 触发清基准。
 static uint8_t gClrHoldStep = 0;
-// ★ v1.10.0:CHARTS 长按进度(进参数页),同一套观感,每档约 214 ms(1.5 s 走满)。
+// ★ v1.10.6:CHARTS 长按进度(进参数页),同一套观感,每档约 714 ms(5 s 走满,与 CLR-BS 同)。
 static uint8_t gChartsHoldStep = 0;
+// ★ v1.10.6:按压动画 —— 当前按在主界面哪个键上(0..3),-1 = 没按。
+//   touch::poll 写,paintBot 据此把该键内缩 3px 重画,松手弹回;
+//   经 btnState() 的 0x80 位进 cBtnSt 去重,不变不画(与长按进度同一套通知链)。
+static int8_t gBtnPress = -1;
 
 // 按键态编码(参与"变才重画"的比对):
 //   0x00 常态 / 0x01 BASE 本次设(SET,绿底) / 0x02 BASE 从 flash 恢复(SAV,青蓝底)
 //   0x10 CLR-BS 常态(base 已设,键灰) / 0x11 CLR-BS 亮绿(base 为空)
-//   0x21..0x27 长按清基准进行中(键灰 + 底部绿色进度条,低 3 位 = 档位)
-//   0x30..0x3A ★ v1.8.6:BASE 采样中(键底中性灰 + 底部绿进度条,低 4 位 = 10 等分进度)
+//   0x21..0x27 长按清基准进行中(键灰 + 顶部绿色进度条★v1.10.6,低 3 位 = 档位)
+//   0x30..0x3A ★ v1.8.6:BASE 采样中(键底中性灰 + 顶部绿进度条★v1.10.6,低 4 位 = 10 等分进度)
 //   ★ BASE 与 CLR-BS 的绿**互斥**(用户 2026-10-17 明确):base 已设 -> BASE 绿、
 //     CLR-BS 灰;base 为空 -> BASE 灰、CLR-BS 绿。同一时刻屏上只有一个绿键。
 //     采样中的 BASE 是**中性灰** —— 那一刻基准还没定,不能提前亮绿。
-static uint8_t btnState(int i) {
+static uint8_t btnStateRaw(int i) {
   switch (i) {
     case 0:
       if (judge::baseSmpOn()) return (uint8_t)(0x30 | (judge::baseSmpStep() & 0x0F));
@@ -2734,6 +2764,12 @@ static uint8_t btnState(int i) {
       return gChartsHoldStep ? (uint8_t)(0x40 | (gChartsHoldStep & 0x07)) : 0x00;
     default: return 0x00;
   }
+}
+// ★ v1.10.6:按压动画位 —— 按在哪个键上就给谁的态打 0x80,跟着 cBtnSt 去重走,
+//   按下/松手各触发一次重画(按下=内缩,松手=弹回),长按进度与动画同屏共存。
+static uint8_t btnState(int i) {
+  const uint8_t v = btnStateRaw(i);
+  return (gBtnPress == i) ? (uint8_t)(v | 0x80) : v;
 }
 
 // 数据条右侧三行(HPL / CN0 / SAT),用 '|' 拼成一条便于比对;画时拆开。
@@ -2823,7 +2859,10 @@ inline void paintBot() {
       case 2: nm = "CHARTS"; break;
       case 3: nm = "LOG";    break;
     }
-    botSpr->fillRoundRect(x + 2, 2, BTN_W - 4, BTN_H - 4, 4, bg);
+    // ★ v1.10.6:按压动画 —— 被按的键内缩 3px 重画(外圈露出页底 = "缩下去"),
+    //   松手 gBtnPress 清掉走原几何,"弹回"。仅主界面键条;注入触摸(kh)同样生效。
+    if (gBtnPress == i) botSpr->fillRoundRect(x + 5, 5, BTN_W - 10, BTN_H - 10, 3, bg);
+    else                botSpr->fillRoundRect(x + 2, 2, BTN_W - 4, BTN_H - 4, 4, bg);
     botSpr->setTextFont(2);                            // FONT2(16px)
     botSpr->setTextSize(1);
     botSpr->setTextColor(fg, bg);
@@ -2831,22 +2870,22 @@ inline void paintBot() {
     botSpr->drawString(nm, x + BTN_W / 2, BTN_H / 2);
     botSpr->setTextDatum(TL_DATUM);
     // ★ v1.8.3:长按进度条 —— 52px 分 7 档,档位由 touch::poll 写进 gClrHoldStep。
-    //   画在文字下方,**不压字**:★ v1.9.0 按键条 40->34 后,字占 9..25,
-    //   进度条从 BTN_H-9(=25,正好贴字底)挪到 BTN_H-7(=27),留给字 2px 余量。
+    //   ★ v1.10.6:画在**键内顶部**(y=4)—— 手指压在键上挡住的是下半部,
+    //   进度条放顶部才看得见(用户实测反馈);字占 9..25,条 4..6,互不压。
     if (i == 1) {
       const uint8_t st = btnState(1);
-      if (st & 0x20) botSpr->fillRect(x + 4, BTN_H - 7, 52 * (st & 0x07) / 7, 3, C_ST_OK);
+      if (st & 0x20) botSpr->fillRect(x + 4, 4, 52 * (st & 0x07) / 7, 3, C_ST_OK);
     }
     // ★ v1.10.0:CHARTS 长按进参数页 —— 同一几何(52px / 3px),同一绿色。
-    //   1.5 s 走满,所以肉眼看是"一按就长满",暗示这一格能长按。
+    //   5 s 走满(★ v1.10.6 与 CLR-BS 统一)。
     if (i == 2) {
       const uint8_t st = btnState(2);
-      if (st & 0x40) botSpr->fillRect(x + 4, BTN_H - 7, 52 * (st & 0x07) / 7, 3, C_ST_OK);
+      if (st & 0x40) botSpr->fillRect(x + 4, 4, 52 * (st & 0x07) / 7, 3, C_ST_OK);
     }
     // ★ v1.8.6:BASE 采样进度条 —— 与 CLR-BS 那条同几何(52px / 3px 高),
     //   0..10 等分;只在采样中画。倒计时文字每秒变一次,靠 btnState(0) 的比对触发重画。
     if (i == 0 && judge::baseSmpOn()) {
-      botSpr->fillRect(x + 4, BTN_H - 7, 52 * judge::baseSmpStep() / 10, 3, C_ST_OK);
+      botSpr->fillRect(x + 4, 4, 52 * judge::baseSmpStep() / 10, 3, C_ST_OK);
     }
   }
   botSpr->drawFastHLine(0, BTN_H, SCR_W, CLR_RULE);    // 按键条与数据条的分界
@@ -3453,7 +3492,7 @@ inline void tick() {
 //  第五 / 第六界面:参数页 PARAMS + 单项编辑(★ v1.10.0 新增)
 // ----------------------------------------------------------------------------
 //  入口(用户 2026-10-17 拍板,三个都做):
-//    ① 主界面**长按 CHARTS 键 1.5 s**  —— 零几何改动,复用 CLR-BS 那套进度条
+//    ① 主界面**长按 CHARTS 键 5 s**(v1.10.6 统一)—— 零几何改动,复用 CLR-BS 那套进度条
 //    ② 第二界面**点 INTEGRITY 卡**      —— 看见 HPL 超限就想调 HPL LIM,动机顺
 //    ③ 串口 **`p`**                     —— 在电脑前/屏不方便时不用伸手指
 //    为什么不是长按 LOG(那也是候选):LOG 那一格短按要进事件列表,再挂一个长按
@@ -3866,6 +3905,12 @@ inline void begin() {
     keyOf((int)i, k, sizeof(k));
     if (prefs.getBytesLength(k) == (int)sizeof(EventRec)) {
       prefs.getBytes(k, &pool[i], sizeof(EventRec));
+      // ★ v1.10.4(评审 S5):NVS 只校验了长度,内容不可信 —— type 越界虽被
+      //   phrase::text()/statusColor565 的 p<PH_COUNT 兜底接住(不会崩,但显示错),
+      //   gga/date 缺 NUL 则 strlen 会读越界。载入时就地加固,一行三查。
+      if (pool[i].type >= (uint8_t)phrase::PH_COUNT) pool[i].type = (uint8_t)phrase::PH_NODATA;
+      pool[i].gga [sizeof(pool[i].gga)  - 1] = 0;
+      pool[i].date[sizeof(pool[i].date) - 1] = 0;
       ++nHave;
     }
   }
@@ -4551,7 +4596,7 @@ inline const char* pageName() {
 //    星空区 (y 0..239)   -> 无动作(误触安全)
 //    按键条 (y 240..279) -> x 四等分:BASE / CLR-BS / CHARTS / LOG
 //                            ★ v1.8.3:第 2 键 = CLR-BS,**按住 5 s** 才清基准
-//    数据条 (y 280..319) -> 长按 >=800ms 切"报文窗",再长按切回
+//    数据条 (y 280..319) -> 长按 >=1s 切"报文窗",再长按切回(v1.10.6 取整)
 //  第二/三/四界面 -> 只认右上 BACK,第三界面另认上下滑动与列表行点击。
 //  另:**动作一律在"抬起"时执行** —— 只有抬起才能分辨点击与滑动。
 //  串口命令照旧可用,两条路并存,互不影响(动图页对应命令 d,日志页对应 v)。
@@ -4594,15 +4639,16 @@ constexpr const char* kNvsName = "gnstouch";
 //   主界面 y 0..239 星空区    -> **无动作**(误触安全 —— 比旧版"点顶部就改基准"安全得多)
 //   主界面 y 240..279 按键条  -> x 四等分:BASE / CLR-BS / CHARTS / LOG
 //                                ★ v1.8.3:CLR-BS **按住 5 s** 才清基准(短按无动作)
-//   主界面 y 280..319 数据条  -> **长按 ≥800ms** 切报文窗 / 切回;短按无动作
+//   主界面 y 280..319 数据条  -> **长按 ≥1s** 切报文窗 / 切回;短按无动作(v1.10.6 取整)
 //   第二界面                   -> 只认右上 BACK
 //   第三界面(事件列表)        -> **PREV / NEXT 按钮整页翻**(★ v1.7.1 新增,顶栏第二行)
 //                                / 上下滑动细滚 3 行 / 点 BACK 回主界面 / 点列表行进详情
 //   第四界面(事件详情)        -> **左右滑动看上/下一条**(★ v1.7.1 新增) / 点 BACK 回第三界面
 constexpr int kPressure    = 600;       // 按下判定压力阈值
-constexpr int kLongPressMs = 800;       // 数据条长按阈值(切报文窗)
+constexpr int kLongPressMs = 1000;      // ★ v1.10.6:数据条长按阈值(切报文窗),800ms→1s 取整(用户定)
 constexpr uint32_t kClearHoldMs = 5000; // ★ v1.8.3:CLR-BS 长按阈值(清基准,满 5 s 当场生效)
-constexpr uint32_t kTuneHoldMs  = 1500; // ★ v1.10.0:CHARTS 长按阈值(进参数页,1.5 s)
+constexpr uint32_t kTuneHoldMs  = 5000; // ★ v1.10.6:CHARTS 长按阈值(进参数页),1.5s→5s 与 CLR-BS 统一(用户定:
+                                        //   "能统一的尽量统一";参数页低频使用,5 s 可接受)
 constexpr int kSwipePx     = 40;        // 日志页滑动判定:竖直位移达到它才算翻页
 constexpr int kDebounce = 350;          // 两次有效点击最小间隔 ms
 constexpr int kTouchWarm = 2000;        // 上电头 2 秒不认触摸(见 poll 里的说明)
@@ -4672,13 +4718,13 @@ static uint16_t downX = 0, downY = 0, moveX = 0, moveY = 0;
 static bool     downSeen = false;
 static uint32_t pressMs  = 0;
 static bool     clrFired = false;   // ★ v1.8.3:本次按压是否已经执行过"长按 5 s 清基准"
-static bool     tuneFired = false;  // ★ v1.10.0:本次按压是否已经执行过"长按 1.5 s 进参数页"
+static bool     tuneFired = false;  // ★ v1.10.0:本次按压是否已经执行过"长按进参数页"(v1.10.6 起 5 s)
 
 // ---------------------------------------------------------------------------
 //  ★★ v1.10.2:演示注入 —— 让**电脑**替手指按屏。
 //  用户 2026-10-17 定:"我去碰的话,手在屏幕上就看着不好看,挡住一部分内容"。
 //  做法:**只替换 poll() 读触摸那一行的返回值**,下面几百行(去抖 / 长按 5 s 进度 /
-//  长按 1.5 s 进参数页 / 滑动翻页 / handleTap 全部分支)**一行都不改**。
+//  长按进参数页 / 滑动翻页 / handleTap 全部分支)**一行都不改**。
 //  为什么不做成"直接调 ui::toTune() / eventlog::selectRow()"这类语义命令:
 //    ① 那样等于给同一件事开第二条实现路径 —— 迟早分叉(本项目已有先例:
 //       'i' 注入与 VFO 偏移两套逻辑并存,最后两边一起删);
@@ -4874,7 +4920,7 @@ inline void poll() {
   uint16_t x = 0, y = 0;
   uint32_t now = millis();
   // ★★ v1.10.2:**唯一**的注入点 —— 有注入动作时,合成坐标**替代** getTouch 的返回值。
-  //   往下所有判据(去抖、长按 5 s、长按 1.5 s、滑动、handleTap)完全不知情,
+  //   往下所有判据(去抖、两处 5 s 长按、滑动、handleTap)完全不知情,
   //   所以"电脑替手按"与"手指按"走的是同一段代码。
   bool down = inj::busy() ? inj::sample(now, x, y)
                           : disp::tft.getTouch(&x, &y, kPressure);
@@ -4894,13 +4940,19 @@ inline void poll() {
     //   进图表页,屏上没反应、串口只有 "inj: tap" 一行,没有任何报错)。
     //   换成 `!downSeen`(false = 这次按压还没记过起点)更直接,且与 wasDown 解耦。
     if (!downSeen) { downX = x; downY = y; pressMs = now; downSeen = true;
-                     clrFired = false; tuneFired = false; }    // 刚按下:记起点
+                     clrFired = false; tuneFired = false;    // 刚按下:记起点
+      // ★ v1.10.6:按压动画 —— 记下按在主界面哪个键上,paintBot 内缩重画一次
+      if (ui::page == ui::PAGE_MAIN && downY >= BTN_Y && downY < BTN_Y + BTN_H) {
+        const int8_t k = (int8_t)(downX / BTN_W);
+        if (k != disp::gBtnPress) { disp::gBtnPress = k; disp::tick(); }
+      }
+    }
     moveX = x; moveY = y;                                                    // 按住期间持续更新终点
 
     // ★★ v1.8.3:主界面第 2 键(CLR-BS)**按住 5 s 当场清基准**,不等松手。
     //   为什么不放在 handleTap 里:那里只有"抬起"这一刻 —— 按 5 秒期间屏上毫无变化,
-    //   用户会怀疑"到底按到了没有"。这里每圈算一次档位(1..7),按键底部进度条逐格
-    //   长满,满 5 s 立刻执行;手指滑出该键(超过 kSwipePx)视为放弃,进度条缩回去。
+    //   用户会怀疑"到底按到了没有"。这里每圈算一次档位(1..7),按键顶部进度条逐格
+    //   长满(★ v1.10.6 从底部挪顶),满 5 s 立刻执行;手指滑出该键(超过 kSwipePx)视为放弃,进度条缩回去。
     //   短按不触发(见 handleTap 的 case 1)—— 清基准是破坏性动作,必须防误触。
     if (downSeen && ui::page == ui::PAGE_MAIN && judge::baseSet && !clrFired) {
       const bool inKey = (downY >= BTN_Y && downY < BTN_Y + BTN_H) && ((downX / BTN_W) == 1);
@@ -4923,11 +4975,11 @@ inline void poll() {
       }
     }
 
-    // ★★ v1.10.0:主界面第 3 键(CHARTS)**按住 1.5 s → 参数页**,不等松手。
+    // ★★ v1.10.6:主界面第 3 键(CHARTS)**按住 5 s → 参数页**(与 CLR-BS 统一),不等松手。
     //   为什么不是长按 LOG(那本是第一候选):LOG 短按要进事件列表,再挂一个长按
     //   等于同一格背两种时间语义;CHARTS 这一格是用户 2026-10-17 自己挑的,照办。
     //   与 CLR-BS 共用同一套"逐档长满"的观感(进度条由 btnState(2) 提供),
-    //   但阈值只有 1.5 s —— 它**不具破坏性**,不需要按那么久,也不该那么久。
+    //   阈值 v1.10.6 起同为 5 s(用户定,统一优先);照样**不等松手**。
     if (downSeen && ui::page == ui::PAGE_MAIN && !tuneFired) {
       const bool inKey = (downY >= BTN_Y && downY < BTN_Y + BTN_H) && ((downX / BTN_W) == 2);
       const bool still = (abs((int)x - (int)downX) < kSwipePx) && (abs((int)y - (int)downY) < kSwipePx);
@@ -4956,6 +5008,10 @@ inline void poll() {
   // ---- 已抬起 ----
   if (wasDown && downSeen) {
     downSeen = false;
+    if (disp::gBtnPress >= 0) {                       // ★ v1.10.6:按压动画弹回
+      disp::gBtnPress = -1;
+      if (ui::page == ui::PAGE_MAIN) disp::tick();    // 页已切走就不补画(回主界面时 resetPaintCaches 兜)
+    }
     if (disp::gClrHoldStep)    { disp::gClrHoldStep = 0;    disp::tick(); }  // 进度条擦掉
     if (disp::gChartsHoldStep) { disp::gChartsHoldStep = 0; }                 // ★ v1.10.0:已进参数页,无需重画
     // 长按已经生效:这次抬手不能再当成一次"点击"(否则 handleTap 会再打一行
@@ -5941,7 +5997,30 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      T_CS 9→14(FSPIWP)、I2C SCL 7→9(官方 Wire 默认对 8/9)、GNSS 换官方 U1
 //      焊盘(模块TXD 16→18,PPS 18→16)、链路 44/43→39/40(把 U0 还给板载 USB 桥)。
 //      判据 / 协议 / NVS / 界面**一行未动**;需按 docs/接线表 v2.2 重新落线。
-constexpr const char* kVer   = "v1.10.3";
+//
+//   ★ v1.10.4(2026-10-22 深夜):**外部评审整改 A 批**(firmware/GNSS_Bench/docs/
+//      code-review-20261022.md,6 处全是"加保险",判据口径零变化):
+//      ① P1 off 缓存 —— 输入不变不重算 double Haversine(原来 loop 每圈白算);
+//      ② S1 wadd 回显密码打码('****'),C3 屏与 USB 日志不再留痕;
+//      ③ S5 事件载入加固(type clamp + gga/date 强制 NUL);
+//      ④ S6 GGA 坐标范围校验(±90/±180,超界当无效帧);
+//      ⑤ S7 PPS 脚 INPUT_PULLDOWN(拔线悬空不再被噪声触发);
+//      ⑥ P10 链路 TX 防洪(余量 <96 B 整条丢,不阻塞主循环)。
+//
+//   ★ v1.10.5(2026-10-23 晨):**复核评审 A 批补充 2 处**(code-review-20261022-v2复核.md):
+//      ① N1 —— `wseed` 同样带密码、走同一条回显路径,echoMasked() 原来只认 "wadd "
+//        漏了它,补上(S1 整改不完整的漏网之鱼);
+//      ② O1 —— PPS 中断 `onEdge` 加 **IRAM_ATTR**:写 flash 期间 cache 被禁,
+//        中断若此刻触发会到 flash 取不到指令直接 panic;旧"无运行期 NVS 写入"的
+//        前提 v1.7.0 起已不成立(过时注释一并更正)。
+//      ★ v1.10.6(2026-10-23,用户拍板的观感统一,判据零变化):
+//      ③ 长按时长统一 —— CLR-BS 5 s(原值)与 CHARTS 1.5 s→**5 s** 看齐;
+//        数据条切报文窗 0.8 s→**1 s**(取整);BASE 采样窗 10 s 保持(用户定)。
+//      ④ 三条长按进度条从键内**底部**挪到**顶部**(y=4):手指压在键上时
+//        挡住的是键的下半部,进度条在顶部才看得见。
+//      ⑤ 四键**按压动画**:按下该键内缩 3px 重画,松手弹回 —— 走 btnState
+//        0x80 位 + cBtnSt 去重,不变不画。
+constexpr const char* kVer   = "v1.10.6";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -6134,6 +6213,31 @@ constexpr int      PIN_TX   = 40;          //   S3 发 → C3 GPIO20(RX)。J3-9/
 constexpr uint32_t kBaud    = 115200;
 constexpr int      kLineMax = 176;         // 最长上行:"@k wadd " + 32(ssid) + 1 + 64(pass)
 
+// ★ v1.10.4(评审 P10,降级版):**TX 防洪保险**。硬件 UART 本不存在"对端断电就积压"
+//   (线松/断电,字节照样按波特率在线上排空)—— 评审把它当"最能死机"是拿 USB CDC 的
+//   毛病套了 UART;真正的风险只有"发送速率持续超过线速"撑满 TX 环后阻塞主循环。
+//   照 @CHT 转发那条纪律:余量 <96 B 就**整条丢弃**。代价:极端情况下对端少看到一条
+//   回执(纯显示/回执语义),比卡死主循环划算。
+static bool txFree() { return Serial2.availableForWrite() >= 96; }
+
+// ★ v1.10.4(评审 S1):wadd 的**密码打码后再回显** —— 原来整行明文进 USB 串口日志、
+//   C3 屏两处留痕,一次演示就能被旁边的人抄走。命令判定用原文(不动),只改"给人看"的
+//   两路输出。打码规则:识别到 "wadd " 前缀时,把第 3 个字段(密码)起全部换成 '*'。
+//   ★ v1.10.5(复核 N1):**wseed 同样带密码**、走同一条回显路径,原来漏了 —— 补上。
+static void echoMasked(uint32_t cmdNo, const char* p) {
+  char m[kLineMax];
+  snprintf(m, sizeof(m), "%s", p);
+  if (!strncmp(m, "wadd ", 5) || !strncmp(m, "wseed ", 6)) {
+    char* s = m + 5;
+    while (*s == ' ') ++s;                  // ssid 起
+    while (*s && *s != ' ') ++s;            // ssid 止
+    while (*s == ' ') ++s;                  // pass 起
+    if (*s) { *s++ = '*'; while (*s) *s++ = '*'; }
+  }
+  Serial.printf("[bench] link cmd #%lu: \"%s\"\n", (unsigned long)cmdNo, m);
+  if (txFree()) Serial2.printf("@s ok %s\r\n", m);    // 回执:C3 屏上当 [s3] 行显示
+}
+
 // 编译期守住 ①:链路脚不能撞台架任何一条已用线(否则现场会变成"时好时坏"的玄学故障)
 static_assert(PIN_RX != 4 && PIN_RX != 6 && PIN_RX != 8 && PIN_RX != 9 &&
               PIN_RX != 10 && PIN_RX != 11 && PIN_RX != 12 && PIN_RX != 13 &&
@@ -6253,7 +6357,7 @@ inline void poll() {
         //     只认这个前缀,发成别的格式会被它**静默丢弃**(见 C3_CmdPad.ino 里那段硬化说明)。
         if (p[4] == ' ') {                             // 带协议号 -> 回握手 + 比对
           const int their = atoi(p + 6);               // "ping P1" -> 1(跳过 "ping P")
-          Serial2.printf("@s ok proto P%d\r\n", kProto);
+          if (txFree()) Serial2.printf("@s ok proto P%d\r\n", kProto);   // ★ v1.10.4 防洪
           if (their != peerProtoSeen) {                // 只在**对端协议号变化**时动作
             peerProtoSeen = their;
             if (their != kProto) {
@@ -6288,8 +6392,7 @@ inline void poll() {
       } else {                                          // ★ 2026-10-15:未登记 -> 不执行
         Serial.printf("[bench] link: unregistered key '%c' ignored (add it to linkKeyAllowed())\n", *p);
       }
-      Serial.printf("[bench] link cmd #%lu: \"%s\"\n", (unsigned long)nCmd, p);
-      Serial2.printf("@s ok %s\r\n", p);                // 回执:C3 屏上当 [s3] 行显示
+      echoMasked(nCmd, p);                // ★ v1.10.4:S1 打码 + P10 TX 防洪(原两行裸回显已并入)
     } else if (n < kLineMax - 1) {
       line[n++] = c;
       // ★ v1.5.17 修(2026-10-11 22:2x 实机揪出):**前缀对齐 / 重新同步**。
@@ -6319,7 +6422,7 @@ inline void poll() {
   //   再看到 wsc 数据 —— 两段天然可分辨。
   char sc[96];
   for (int k = 0; k < 2 && wifi10::scanNextLine(sc, sizeof(sc)); ++k)
-    Serial2.printf("@s ok %s\r\n", sc);
+    if (txFree()) Serial2.printf("@s ok %s\r\n", sc);   // ★ v1.10.4 防洪
 
   // ★ v1.5.17:wifi **连接结果**回执("wifi ok <ip>" / "wifi fail <ssid>")。
   //   为什么必须有:上面那行 `@s ok <原命令>` 对任何命令都无条件回显,
@@ -6328,14 +6431,14 @@ inline void poll() {
   //   这两行才是真结果:拿到 IP 才发 ok,10 s 超时发 fail。
   char rp[64];
   for (int k = 0; k < 2 && wifi10::rptNext(rp, sizeof(rp)); ++k)
-    Serial2.printf("@s ok %s\r\n", rp);
+    if (txFree()) Serial2.printf("@s ok %s\r\n", rp);   // ★ v1.10.4 防洪
 
   // ★ v1.8.0:事件日志搬运帧(evth/evts/evtr/evtd/evtg)分条回执 —— 与 wscan 同规矩:
   //   每圈最多 2 条,一页 12 帧六圈发完(主循环一圈毫秒级,C3 感知不到等待)。
   //   前缀 "@s ok " 在这里统一加 —— C3 的 poll() 只认这个前缀,发成别的格式会被静默丢弃。
   char el[128];
   for (int k = 0; k < 2 && eventlog::evtNextLine(el, sizeof(el)); ++k)
-    Serial2.printf("@s ok %s\r\n", el);
+    if (txFree()) Serial2.printf("@s ok %s\r\n", el);   // ★ v1.10.4 防洪
 }
 
 // 注:v1.5.13 这里曾有一个链路自检 selftest()(串口命令 'k')—— 靠它自环/逐根验线,
@@ -6797,7 +6900,7 @@ void loop() {
     gTouchRebootPend = false;
     char rp[64];
     while (wifi10::rptNext(rp, sizeof(rp)))
-      Serial2.printf("@s ok %s\r\n", rp);   // 格式与 benchlink::poll 逐字一致
+      if (benchlink::txFree()) Serial2.printf("@s ok %s\r\n", rp);   // 格式与 benchlink::poll 逐字一致;★ v1.10.4 防洪
     Serial2.flush();                        // 等 UART2 真发完再动
     Serial.println("[bench] touch: 校准已清,1.5s 后重启进 4 点校准 ...");
     Serial.flush();

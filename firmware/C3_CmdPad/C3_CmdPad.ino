@@ -1196,7 +1196,14 @@ constexpr const char* kSub2  = "STUDIO";
 //   ③ 旧「2 s 电平翻转」**删除**:WS2812 对普通高低电平不响应(这就是换板后灯从不亮的
 //     原因),且 digitalWrite 与 RMT 输出在同一个脚上打架;setup() 里 pinMode/digitalWrite(8)
 //     一并撤;④ 引脚 = GPIO8 是官方 DevKitM-1 口径(接线图 J3-6「IO8 板载 RGB」佐证)。
-constexpr const char* kVer   = "v1.2.6";
+//
+//   ★ v1.2.7(2026-10-23 晨,配套 S3 v1.10.5):**外部评审 A 批 2 处**
+//     (C3_CmdPad/docs/code-review-20261022.md #1/#2,S3 零改动不重烧):
+//     ① toggle()('t')补 MODE_EVT 分支 —— 原 LOG 页按 't' 直接进校准屏,不清
+//       evtOpenFlag/sink,后台残留"LOG 页开着"随时劫持回跳 + 偷吃 S3 事件帧;
+//     ② alertClose() 补 MODE_EVT 回退分支 —— LOG 页弹的告警点掉后回 LOG 页
+//       (原落 else 进命令板,同样残留);清理逻辑抽成 evtCleanup() 供任意状态调用。
+constexpr const char* kVer   = "v1.2.7";
 
 constexpr uint32_t kExpandMs = 5000;    // 展开时间下限(与 S3 同)
 constexpr uint32_t kHoldMs   = 2000;    // 定格(与 S3 同)
@@ -2711,9 +2718,17 @@ static void evtOpen() {
   Serial.println("[c3] evt: page open, asked evtlist 0");
 }
 
-static void evtExit() {
+// ★ v1.2.7(评审 #1/#2):清理逻辑抽成独立函数,**可从任何状态调用** —— 原来只有
+//   evtExit() 清 evtOpenFlag/sink,toggle()('t' 切校准屏)与 alertClose()(告警回退
+//   落 else)从 LOG 页切走时都不清:后台残留"LOG 页开着",evtPoll() 一有新数据就
+//   evtDraw()(首行 mode=MODE_EVT)把用户从别的页劫持回 LOG,还偷吃 S3 事件帧。
+static void evtCleanup() {
   s3link::setSink(nullptr);
   evtOpenFlag = false;
+}
+
+static void evtExit() {
+  evtCleanup();
   Serial.println("[c3] evt: exit");
   enterBoard();
 }
@@ -2867,6 +2882,8 @@ static void alertClose(bool ok) {
   const Mode back = alertBack;
   if      (back == MODE_LIST) lsDraw();
   else if (back == MODE_SCAN) scDraw();
+  else if (back == MODE_EVT) evtDraw();   // ★ v1.2.7(评审 #2):LOG 页弹的告警,点掉回 LOG 页
+                                          //   (原来落 else 进命令板,evtOpenFlag 残留被劫持)
   else                        enterBoard();
   if (cb) cb(ok);
 }
@@ -3809,6 +3826,8 @@ inline void toggle() {
   if (kbOpen)            { kbCancel();        return; }
   if (mode == MODE_SCAN) { scExit();          return; }   // ★ v0.7
   if (mode == MODE_LIST) { lsExit();          return; }   // ★ v0.9
+  if (mode == MODE_EVT)  { evtExit();         return; }   // ★ v1.2.7(评审 #1):原漏此分支,
+                                                          //   LOG 页按 't' 直接进校准屏且不清状态
   if (mode == MODE_CAL) enterBoard();
   else                  enterCal();
 }
