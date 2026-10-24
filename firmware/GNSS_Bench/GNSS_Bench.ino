@@ -241,7 +241,7 @@ constexpr int PIN_GNSS_PPS   = 16;   // 模块 PPS(1Hz 秒脉冲) --> 用于校�
 //   这份引脚表是从另一个项目沿用的,那边背光走 GPIO7。2026-10-22 官方重排后
 //   SHT30 的 SCL 挪到 GPIO9(官方 Wire 默认对),GPIO7 彻底空闲 —— 哪天改成
 //   GPIO 控背光,把 BLK 挂到 7 是现成的候选(仍要先查与台架其它线不冲突)。
-#define TFT_BL_ON_GPIO    0          // 1=背光由 GPIO 控制(需在 User_Setup 里定义 TFT_BL)
+#define TFT_BL_ON_GPIO    1          // ★ 2026-10-24:0→1(BLK 已接 GPIO7;需 User_Setup 定义 TFT_BL)
                                      // 0=背光直连 3.3V 常亮(本项目)
 #if TFT_BL_ON_GPIO
   #ifndef TFT_BL
@@ -267,6 +267,18 @@ constexpr int PIN_SHT_SDA    =  8;
 //          T_IRQ=GPIO5(轮询方式,不接也行)。沿革 09-30~10-21 T_CS=GPIO9(已让给 I2C SCL)。
 // 注意:这个开关必须是宏(#define),不能用 constexpr —— 下面要拿它做 #if 判断。
 #define ENABLE_TOUCH  1              // 1=开触屏控制  0=只用串口命令
+
+// ★ v1.12.0(A5):演示注入(kt/kh/ks)编译开关。默认开 —— 这是 v1.10.2 拍板的既定
+//   演示功能,默认关会让演示脚本失效;但插个串口就能长按清基准,公开场合/交接后
+//   可改 0 重编,命令自然变成"未知命令"。包住:touch::inj 整段 + consoleKey case 'k'
+//   + 帮助行 + touch::poll 里的注入采样点(四处,均有 #if 守护)。
+#define ENABLE_INJ   1
+
+// ★ v1.12.0(A14):熄屏期间的全局屏状态(定义放最前 —— led::apply 在 disp 之前就要读它)。
+//   true = 屏已 SLEEP IN 且背光 0,一切推屏/绘制停;保留 gnss/judge/sht/事件落盘/PPS。
+static bool gScreenOff = false;
+constexpr bool kLedFollowScreen = true;   // 熄屏时板载 WS2812 一并灭(用户定"不表达状态");
+                                          // 将来想"灯常亮、屏可灭"改 false 即可
 
 // ---------------- 编译期自检 ----------------
 // 思路换了一下,所以条数从 8 条降到 3 条:
@@ -1074,6 +1086,13 @@ struct State {
   // ★ 曾经想在这里存"参与解算的 PRN 并集"(uint64 位掩码)给 σ 用,
   //   实测发现本模块的 GNGSA 跨星座重号、并集无法归因,已删除 —— 见 sigmaUere()。
 
+  // ---- 来自 RMC(★ v1.13.0/B1:对地速度,只用于归因,不进判据门限)----
+  //  为什么用 RMC 不用 VTG:两者都有,但 RMC 已在模块默认输出里,VTG 要另外确认;
+  //  而且 RMC 的状态位(A/V)顺手给了有效性,不用另判。
+  float    sogMps   = 0;      // 对地速度 m/s(节 × 0.514444)
+  uint32_t sogMs    = 0;      // 最近一次刷新(ms)
+  bool     sogValid = false;  // 收到过至少一条状态为 A 的 RMC
+
   // ---- 计数(排查用)----
   uint32_t sentences = 0;
   uint32_t ggaCount  = 0;
@@ -1333,6 +1352,20 @@ static void handleGSA(const char* name, int n) {
   if (v > 0.0f && v < 100.0f) st.vdop = v;
 }
 
+// $GNRMC,hhmmss.ss,A,llll.ll,a,yyyyy.yy,a,sog,cog,ddmmyy,mv,mvE,mode*cs
+//   fld[1]=UTC 时间  fld[2]=状态(A=有效/V=无效)  fld[7]=SOG(节)  fld[8]=COG
+// ★ v1.13.0(B1):只取 SOG。RMC 也带日期,但只有 2 位年,项目里时间一律走 ZDA
+//   (见 st 的注释),这里绝不碰日期,免得出现第二个"现在几点"的来源。
+static void handleRMC(int n) {
+  if (n < 8) return;                       // 字段不够,整句丢
+  if (fld[2][0] != 'A') return;            // V = 无有效解,此时的 SOG 是 0 占位,不能信
+  const float kn = atof(fld[7]);
+  if (!(kn >= 0.0f) || kn > 2000.0f) return;   // 防 NaN / 防垃圾值(2000 节远超任何地面设备)
+  nmea::st.sogMps   = kn * 0.514444f;
+  nmea::st.sogMs    = millis();
+  nmea::st.sogValid = true;
+}
+
 static void feed(const char* sentence) {
   if (!sentence || sentence[0] != '$') return;
   int len = (int)strlen(sentence);
@@ -1350,6 +1383,7 @@ static void feed(const char* sentence) {
   st.sentences++;
 
   if      (strstr(name, "GGA")) handleGGA(n);
+  else if (strstr(name, "RMC")) handleRMC(n);   // ★ v1.13.0(B1):对地速度(归因用)
   else if (strstr(name, "GSV")) handleGSV(name, n);
   else if (strstr(name, "GSA")) handleGSA(name, n);   // ★ v1.9.0:PDOP/VDOP + 参与星表
   else if (strstr(name, "ZDA")) handleZDA(n);   // ★ 2026-10-01:UTC 日期 + 时间
@@ -1416,6 +1450,12 @@ enum PhraseId {
                 //   2026-10-17 实测:一段 POS-BAD 持续 12 分 23 秒,而两端 off 只有 19.3 / 17.3 m
                 //   —— 用户看到红屏 + "数据都很好",完全不知道是被哪条点着的。
                 //   合成一个词等于把"趋势"说成"事实",这就是那次困惑的来源。
+  PH_NOBASE,    // ★ v1.12.0(A1):没设基准 —— 信号层全过,但位置层判据根本没跑。
+                //   ★★ 只能追加在 PH_DRIFT 之后、PH_COUNT 之前:PhraseId 数值存进
+                //   NVS 事件记录(EventRec.type),插中间 = 全部历史事件类型错位。
+                //   颜色灰("还没到能判断的状态",与 SEARCH/NO-DATA 同档)。
+                //   ★ 隐含依赖(回执 #3):NO-BASE 永不触发事件(bad 表达式无 noBase 项),
+                //   所以 C3 文案表不用同步加词 —— 若将来让它落事件,必须同步 C3。
   PH_COUNT
 };
 
@@ -1438,6 +1478,8 @@ static const char* const kText[PH_COUNT] = {
   "HPL-HIGH",   // PH_HPLHIGH  ★ v1.9.0:保护级超出告警限 —— 此刻**报警本身不可信**
   "DRIFT",      // PH_DRIFT    ★ v1.10.1:坐标在慢慢漂(还没到 POS LIM)。
                 //   5 个字符,FONT4 下约 95px —— 比 "DEGRADED"(8 字符/152px)短,宽度无忧。
+  "NO-BASE",    // PH_NOBASE   ★ v1.12.0(A1):没设基准,位置层判据未跑 —— 不能报"完好"。
+                //   7 字符,FONT4 下约 133px < 158px 领地,宽度安全。
 };
 
 inline const char* text(PhraseId p) {
@@ -1470,12 +1512,23 @@ namespace integ {
   bool  slowOn();            // CUSUM 判定"在慢慢漂"
   bool  valid();             // 这一拍 HPL 算得出来吗
   float hpl();               // 水平保护级(米)
+  int   mpCount();           // ★ v1.13.0(B4):多径星数(判据侧只读)
+  float mpPeak();            // ★ v1.13.0(B4):最强多径残差 dB(判据侧只读)
 }
 
 namespace judge {
 
 enum Level  { LV_OK = 0, LV_DEGRADED, LV_ABNORMAL, LV_LOST };
 enum Reason { R_NONE = 0, R_SIGNAL, R_POSITION, R_NODATA };
+
+// ★ v1.13.0(B5):归因枚举。只回答"这条异常像什么",不回答"算不算异常"(那是 level 的事)。
+//   优先级 STEP > MP > SOL:宁可把真位移当真,也不要把真位移说成多径。
+enum Cause : uint8_t {
+  C_NONE = 0,   // 说不清,或正常态
+  C_STEP = 1,   // 阶跃 —— 最像真位移
+  C_MP   = 2,   // 多径 —— 城市反射
+  C_SOL  = 3,   // 解算精度不足 —— 数值在 HPL 允许范围内
+};
 
 struct Result {
   Level  level  = LV_LOST;
@@ -1485,6 +1538,7 @@ struct Result {
                                                //   `phrase` 同名会被同名遮蔽规则盯上,可读性也差
   const char* tag = "WAIT";                    // 串口报表用的 ASCII 标签
   float offsetM = 0;
+  Cause  cause  = C_NONE;      // ★ v1.13.0:归因(只做标注,不参与报警判定)
 };
 
 static Result      res;
@@ -1586,6 +1640,23 @@ inline void loadBase() {
   Serial.printf("[bench] base restored from NVS (SAV %.5f,%.5f)\n", baseLat, baseLon);
 }
 
+// ---- ★ v1.13.0(B2):off 的慢采样历史,每 5 s 存一格,12 格 = 60 s ----
+//  为什么 5 s 而不是 1 Hz:阶跃是秒级事件,1 Hz 记 60 格要 240 B 且没必要;
+//  5 s 粒度对"被撞"完全够(撞完会停住几十秒以上),内存只要 48 B。
+//  kStepM = 8.0 的依据(2026-10-23 用户口径):随风晃(厘米级)、日晒热胀(mm/h)、
+//  基础缓慢下沉(mm/天)都**不算异常**,这三类 60 s 内位移远小于 8 m;杆体被撞、
+//  设备被搬动的可辨识下限在这个量级以上。8 m 同时是 30 m 门限的约 1/4,不与主门限打架。
+constexpr uint8_t  kStepSlots   = 12;
+constexpr uint32_t kStepSlotMs  = 5000;
+constexpr float    kStepM       = 8.0f;     // 60 s 内变化 ≥ 8 m 视为阶跃
+constexpr uint32_t kStepHoldMs  = 120000;   // 阶跃标志保持 2 min(事件落笔可能晚于跳变)
+
+static float    sStepHist[kStepSlots] = {0};
+static uint8_t  sStepIdx    = 0;
+static uint32_t sStepLastMs = 0;
+static bool     sStepFull   = false;
+static uint32_t sStepAtMs   = 0;     // 最近一次判定为阶跃的时刻
+
 inline void saveBase(double lat, double lon) {
   baseLat = lat;
   baseLon = lon;
@@ -1596,6 +1667,9 @@ inline void saveBase(double lat, double lon) {
   //   不重建的后果不是误报而是**漏报**:μ 还记着旧基准下那个偏了 200 m 的
   //   off,新的 off 从 0 起算,dev 长期为负,统计量永远压在 0,"真漂了也不报"。
   integ::resetBaseline();
+  // ★ v1.13.0(B2):阶跃缓冲一并清零 —— 新基准的 off 从 0 起步,旧缓冲里的
+  //   200 m 会让下一格(5 s 后)立刻误判成 STEP。
+  sStepIdx = 0; sStepFull = false; sStepLastMs = 0; sStepAtMs = 0;
 }
 
 inline void clearBase() {
@@ -1605,6 +1679,7 @@ inline void clearBase() {
   smpOn   = false; smpN = 0;                                // ★ v1.8.6:清基准同时中断采样
   prefs.remove("base");                                     // ★ v1.7.0:擦掉 flash 里那份
   integ::resetBaseline();                                   // ★ v1.9.0:同上
+  sStepIdx = 0; sStepFull = false; sStepLastMs = 0; sStepAtMs = 0;   // ★ v1.13.0(B2):同上
 }
 
 // ============================================================================
@@ -1625,8 +1700,8 @@ inline void clearBase() {
 //       任一不满足**直接拒绝**,不落盘,并把原因回执给 C3(产线工装看得见)。
 //    P2 采样平均:门限过了也**不当场落盘**,先 1 Hz 采 10 s,要求样本极差 <= 25 m,
 //       通过才把**均值**写进 flash。这样连"HDOP 好看但位置还在跳"也能挡住。
-//  采样期间屏上第 1 键变 `SET 10..0` 倒计时 + 底部绿进度条;取消/重设/清基准
-//  都会中断采样(见 clearBase / beginBaseSample)。
+//  采样期间屏上第 1 键变 `CANCEL`(v1.13.0,原为 `SET 10..0` 倒计时)+ 顶部绿进度条;
+//  再点一下即取消(见 cancelBaseSample)/ 清基准也中断采样(见 clearBase)。
 // ============================================================================
 inline bool baseSmpOn() { return smpOn; }
 
@@ -1654,6 +1729,38 @@ inline bool beginBaseSample() {
   smpOn = true; smpT0 = millis(); smpLast = 0; smpN = 0;
   smpSumLat = smpSumLon = 0;
   return true;
+}
+
+// ★ v1.13.0:取消进行中的采样(用户拍板:倒计时中点 BASE 键即取消,不必绕 CLR-BS 长按)。
+//   只掐采样本身:不落盘、不动 NVS、不动已有基准、不重建 CUSUM(采样从未改过尺子)。
+//   返回 false = 本来就不在采样中(调用方不必重复提示)。
+inline bool cancelBaseSample() {
+  if (!smpOn) return false;
+  smpOn = false; smpN = 0;
+  Serial.println("[bench] base sampling cancelled");
+  return true;
+}
+
+// ---- ★ v1.13.0(B1):静止判定(只用于归因,不进判据门限)----
+// kStaticSog 的依据:GNSS 多普勒测速在静止时的噪声典型 0.02~0.10 m/s
+// (开源接收机实测口径),取 0.30 留 3 倍余量。这个数**不是可调项**,不进 tune ——
+// 它是物理分辨率,不是策略选择,放到 PARAMS 页只会让人乱调。
+constexpr float    kStaticSog      = 0.30f;   // m/s
+constexpr uint32_t kStaticFreshMs  = 3000;    // RMC 超过 3 s 没刷新就不算数
+inline bool isStaticNow() {
+  return nmea::st.sogValid
+      && (millis() - nmea::st.sogMs < kStaticFreshMs)
+      && (nmea::st.sogMps < kStaticSog);
+}
+
+// 归因名字(串口/详情页/CSV 三处共用;C_NONE 显示 "---")
+inline const char* causeName(Cause c) {
+  switch (c) {
+    case C_STEP: return "STEP";
+    case C_MP:   return "MP";
+    case C_SOL:  return "SOL";
+    default:     return "---";
+  }
 }
 
 // P2 采样一拍:1 Hz 收一个点;到 10 s 收尾判极差,通过就把均值落盘。
@@ -1772,6 +1879,20 @@ inline void update() {
   //   所以放在这里每圈调用是安全的 —— 它的输入本来就只有 1 Hz 的 NMEA。
   integ::tick(off);
 
+  // ---- ★ v1.13.0(B2):阶跃检测(只记标志,不参与是否报警)----
+  const uint32_t nowMs = millis();
+  if (sStepLastMs == 0 || (nowMs - sStepLastMs) >= kStepSlotMs) {
+    // 取样前先比:idx 指向的正是"12 格之前"那一格(最老)。
+    // sStepFull 之前不能比 —— 前 60 s 缓冲里是 0,off 一上来就 30 m 会立刻误判。
+    if (sStepFull && fabsf(off - sStepHist[sStepIdx]) >= kStepM)
+      sStepAtMs = nowMs;
+    sStepHist[sStepIdx] = off;
+    sStepIdx = (uint8_t)((sStepIdx + 1) % kStepSlots);
+    if (sStepIdx == 0) sStepFull = true;
+    sStepLastMs = nowMs;
+  }
+  const bool stepNow = (sStepAtMs != 0) && ((nowMs - sStepAtMs) < kStepHoldMs);
+
   const bool hplBad = integ::hplBadOn();
 
   bool sigBad  = stale
@@ -1797,6 +1918,30 @@ inline void update() {
   //   排序仍是**距离优先**:同时成立时报 POS-BAD,因为事实强于趋势。
   const bool overLim = baseSet && !hplBad && (off > tune::posLim());
   const bool driftOn = baseSet && !hplBad && !overLim && integ::slowOn();
+
+  // ---- ★ v1.13.0(B3/B4):归因证据(只标注,不影响 bad/alarm 的任何一项)----
+  // B3:越线,但偏差仍在 2×HPL 之内 —— 当前解的误差上限本来就允许这么大。
+  //   系数 2.0 的依据:保护级是"99.999% 不超"的包络,HPL 本身已含 ~3.3σ 量级;
+  //   再乘 2 是极宽松的门,只用来识别"明显由解算精度解释得掉"的那一档。
+  //   这一档**照旧报警**,只是标 cause=SOL,让人知道先怀疑天空,别先怀疑设备。
+  //   integ::valid() 必须显式判:HPL=0(无有效解)时 off < 0 恒假,但依赖太隐晦。
+  const bool solLimited = overLim && integ::valid() && (off < 2.0f * integ::hpl());
+  // B4:多径疑似:越线 + 至少 2 颗星明显强于模板。
+  //   n≥2 而不是 n≥1:单颗星的残差异常太常见(一颗低仰角星被挡一下就够了),
+  //   要 2 颗同时成立才算"环境特征",否则会把噪声当多径。
+  //   强度门槛复用 tune::mpThrDb()(默认 10 dB),不新增参数。
+  const bool mpSuspect  = overLim
+                       && (integ::mpCount() >= 2)
+                       && (integ::mpPeak()  >= tune::mpThrDb());
+  // 优先级 STEP > MP > SOL:宁可把真位移当真,也不要把真位移说成多径。
+  auto causeOf = [](bool st, bool mp, bool sol) -> Cause {
+    if (st)  return C_STEP;
+    if (mp)  return C_MP;
+    if (sol) return C_SOL;
+    return C_NONE;
+  };
+  const Cause nowCause = causeOf(stepNow, mpSuspect, solLimited);
+
   bool qualBad = (nmea::st.cn0Ms != 0)
               && ((now - nmea::st.cn0Ms) < TH_STALE_MS)
               && (nmea::st.cn0Median < tune::cn0Min());
@@ -1832,6 +1977,14 @@ inline void update() {
     } else if (qualBad) {
       res.level = LV_DEGRADED; res.reason = R_SIGNAL;
       res.ph = phrase::PH_DEGRADED; res.tag = "DEGRADED";
+    } else if (!baseSet) {
+      // ★ v1.12.0(A1):信号层全过,但位置层判不了 —— 不能报"完好"。
+      //   优先级必须是 信号层 > NO-BASE > 位置层(SIG-BAD/LOST/HPL-HIGH/DEGRADED
+      //   都不依赖基准,不能被"没基准"盖掉)。level 取 DEGRADED 而非 OK:
+      //   bad 表达式里没有 noBase 项,不会触发告警/事件抖动;level 只影响
+      //   串口 s 的等级字 —— "完好性未评估"属于降级,不属于正常。
+      res.level = LV_DEGRADED; res.reason = R_NONE;
+      res.ph = phrase::PH_NOBASE;  res.tag = "NO-BASE";
     } else {
       res.level = LV_OK;       res.reason = R_NONE;
       // ★ v1.9.0:tag 跟屏上一致改成 INTEG-OK(原来叫 NORMAL)。
@@ -1877,6 +2030,7 @@ inline void update() {
   }
 
   res.offsetM = off;
+  res.cause  = nowCause;    // ★ v1.13.0(B5):归因只标注;放在状态词分支之后,防被覆盖
 }
 
 }  // namespace judge
@@ -2042,14 +2196,23 @@ void tick(float off) {
   //    两者之差才是"漂",差值减去允许起伏 k 后逐拍累积。
   if (judge::baseSet && nmea::st.fixValid) {
     if (!sFiltInit) {
-      sOffFilt = off; sMu = off; sFiltInit = true;
+      sOffFilt = off;
+      // ★ v1.13.1 重启失忆补丁(2026-10-24 阳台实测):开机时 off 已过绝对闸(≥8m)的话,
+      //   μ 锚在基准(0),不能再跟着 off 走 —— 否则 μ 先站上 11m、dev 恒 0,
+      //   检测器对"开机即偏"永久失明(实证:15:42 重启后 off 11.7m 全程 INTEG-OK,
+      //   事件 #204/#205;回放 tools/重启失忆-回放对比.py 三情景全绿)。
+      //   off < 8m 时 μ=off,与 v1.13.0 完全一致 —— v1.9.0 的"3m 假漂"预热治法不变。
+      sMu = (off < kCusumMinM) ? off : 0.0f;
+      sFiltInit = true;
       sWarmSince = now; g.cusum = 0; g.slow = false;
     }
     sOffFilt += kCusumAlpha * (off - sOffFilt);
     const float dev = sOffFilt - sMu;
     if ((now - sWarmSince) < kCusumWarmMs) {
       // 预热期:μ 快追,统计量锁 0(理由见 kCusumWarmMs 的注释)
-      sMu += kCusumWarmA * dev;
+      // ★ v1.13.1:快追加同一道闸 —— off 已过 8m 时不吸收,否则预热 90s 就把
+      //   大偏移吃进基线,补丁①白做。两道闸合起来:预热结束即由 CUSUM 如实点亮。
+      if (sOffFilt < kCusumMinM) sMu += kCusumWarmA * dev;
       g.cusum = 0;
       g.slow  = false;
     } else {
@@ -2095,6 +2258,11 @@ bool  hplBadOn() { return g.hplBad; }
 bool  slowOn()   { return g.slow; }
 bool  valid()    { return g.valid; }
 float hpl()      { return g.hpl; }
+// ★ v1.13.0(B4):判据侧要用,补两个只读口子。只暴露"数量"和"强度",
+//   不暴露 mpPrn/mpEl —— 那两个是显示用的,判据不需要,暴露了会诱使后来的人
+//   拿 PRN 做判断(跨星座重号,不可靠)。
+int   mpCount()  { return g.mpN; }
+float mpPeak()   { return g.mpMax; }
 
 }  // namespace integ
 
@@ -2118,6 +2286,7 @@ inline uint16_t statusColor565(phrase::PhraseId ph, uint8_t blink) {
     case phrase::PH_LOST:     return blink ? CLR_PAPER : C_ST_POS; // 红闪 LOST(灭相 = 页底色)
     case phrase::PH_HPLHIGH:  return C_ST_HPL;                     // 紫 HPL-HIGH(★ v1.9.0)
     case phrase::PH_DRIFT:    return C_ST_DRIFT;                   // 琥珀 DRIFT(★ v1.10.1)
+    case phrase::PH_NOBASE:   return C_ST_GREY;                    // ★ v1.12.0(A1):灰 = 还没到能判断的状态
     case phrase::PH_WAIT:                                          // 等待数据 -> 与 SEARCH 同档
     case phrase::PH_SEARCH:   return C_ST_GREY;                    // #7A8794 灰 SEARCH
     case phrase::PH_NODATA:   return C_ST_GREY;                    // #7A8794 灰 NO-DATA
@@ -2177,6 +2346,9 @@ inline void begin() {
 }
 
 inline void apply() {
+  // ★ v1.12.0(A14):熄屏时灯一并灭(kLedFollowScreen,用户定"熄屏期间不表达状态")。
+  //   想改成"灯常亮、屏可灭",把配置区 kLedFollowScreen 改 false 即可。
+  if (kLedFollowScreen && gScreenOff) { setColor(0, 0, 0); return; }
   // 与屏取同一个 statusColor565() —— 灯和星空图光环永远同色(565 展开成 888 而已)
   // ★ v1.7.0:改传**状态词**(原来传 judge::Level)—— 与光圈、数据条状态词同一入口,
   //   灯也随 5 档换色:SEARCH/NO-DATA 档灯是**灰**,不再是原来的蓝。
@@ -2422,14 +2594,46 @@ inline void begin() {
   // 色序/反显不再有运行时命令,要改请动 User_Setup.h 的 TFT_RGB_ORDER / TFT_INVERSION_ON。
   madctlNow = TFT_MAD_MX | TFT_MAD_COLOR_ORDER;
 
-  // 背光:本项目把 BLK 直接接 3.3V,常亮,代码不用管(见配置区 TFT_BL_ON_GPIO)。
-  // GPIO7 已经给了 SHT30 当 I2C 的 SCL,再往它写高电平就是和 I2C 抢线,所以不能写。
+  // 背光:★ v1.12.0(A14) 走 LEDC(PWM 5kHz,核心 3.x API)—— digitalWrite 只有
+  //   全亮/全灭,做不了中间亮度档。BLK 接 GPIO7(A14 接线)后生效;
+  //   TFT_BL_ON_GPIO=0(未接线)时本段整体关掉,行为与旧版一致。
+  //   (核心 2.x 写法:ledcSetup(ch,5000,8)+ledcAttachPin(pin,ch)+ledcWrite(ch,duty) —— 本机 3.3.8 不用。)
 #if TFT_BL_ON_GPIO
-  pinMode(PIN_TFT_BL, OUTPUT);
-  digitalWrite(PIN_TFT_BL, HIGH);
+  ledcAttach(PIN_TFT_BL, 5000, 8);
+  ledcWrite(PIN_TFT_BL, 255);                  // 初始全亮
 #endif
 
   tft.fillScreen(CLR_PAPER);         // ★ v1.7.0:铺**深色**页底(原来铺白,是全屏刺眼的根源)
+}
+
+// ---------------- ★ v1.12.0(A14) 熄屏 / 唤醒 / 调光三件(唯一真源,调试命令也走这里) ----------------
+// ILI9341 命令字:TFT_eSPI 2.5.43 未导出 TFT_SLPIN/SLPOUT 宏,按数据手册 §8.2.11/8.2.12 本地定义。
+constexpr uint8_t CMD_LCD_SLPIN  = 0x10;    // SLEEP IN:驱动 IC 进睡眠(内部 120ms 生效)
+constexpr uint8_t CMD_LCD_SLPOUT = 0x11;    // SLEEP OUT:下一条命令下限 5ms,完全退出 120ms
+// 顺序纪律(错序会在夜里闪白):熄 = 先灯后屏(背光 0 → SLEEP IN);
+//                              醒 = 先屏后灯(SLPOUT + 120ms → 抬背光)。
+//  SLEEP IN 期间停止一切推屏:手册 8.2.11 原文 GRAM 写入仍允许且内容保持,
+//  但屏已整屏黑、写了也看不见,且醒来后 GRAM 是旧帧必须整页重画(回执 #4)。
+inline void setBacklight(uint8_t pct) {
+  if (pct > 100) pct = 100;                    // 越界钳位
+#if TFT_BL_ON_GPIO
+  ledcWrite(PIN_TFT_BL, (uint16_t)((uint32_t)pct * 255u / 100u));
+#else
+  (void)pct;                                   // 未接线:BLK 直连 3.3V,调不了(如实不动)
+#endif
+}
+
+inline void sleepPanel() {
+  gScreenOff = true;                           // 必须先置,否则 loop 会继续往睡着的屏写 GRAM
+#if TFT_BL_ON_GPIO
+  setBacklight(0);                             // 先灯
+#endif
+  tft.writecommand(CMD_LCD_SLPIN);  delay(5);  // 后屏(0x10);背光不动是 P9-c"只 SLEEP"对照态
+}
+
+inline void wakePanel() {
+  tft.writecommand(CMD_LCD_SLPOUT); delay(120); // 先屏(0x11;手册:120ms 才完全退出)
+  gScreenOff = false;                          // 后灯:screenWake() 统一给 100%(v1.12.1 起)
 }
 
 // ---------------- 两块主界面 sprite 的申请 / 释放(互斥纪律) ----------------
@@ -2828,25 +3032,28 @@ inline void paintBot() {
   //   连带一处语义改动:BASE 的两个态原来靠**描边颜色**承载(绿框/蓝框),现在描边没了,
   //   改由**底色**承载 —— 绿 = 本次设 / 青蓝 = 上电恢复,配**深色字**(照 C3 的 MENU 键 bg=强调色+fg=页底色)。
   //   四个键几何完全一致(60x40 的格子里内缩 2px),只有底色不同,所以仍是一条规则的按钮带。
-  char nmBuf[8];                                     // ★ v1.8.6:采样倒计时文字落脚处
+  // (★ v1.13.0:原 nmBuf 倒计时缓冲随 `SET 10..0` 文案一起删 —— 键面现在直接显示 CANCEL)
   for (int i = 0; i < 4; ++i) {
     const int x = i * BTN_W;
     uint16_t bg = C_BLOCK, fg = CLR_INK;
     const char* nm = "";
     switch (i) {
       case 0:
-        // ★ v1.8.6:P1/P2 采样中 -> 键面显示 `SET 10..0` 倒计时,键底保持中性灰
-        //   (基准还没定,DON'T 提前亮绿;绿 = 已落盘这个语义不能混)。
+        // ★ v1.13.0:采样中键面**直接显示 `CANCEL`**(用户拍板:"倒计时数字不用显示,
+        //   写成 CANCEL,点它就是取消")—— 顶部绿色进度条照走(采样进度语义保留)。
+        //   基准还没定,DON'T 提前亮绿;绿 = 已落盘这个语义不能混。
         if (judge::baseSmpOn()) {
-          const uint8_t st = judge::baseSmpStep();
-          snprintf(nmBuf, sizeof(nmBuf), "SET %u",
-                   (unsigned)(st > 10 ? 0u : 10u - st));
-          nm = nmBuf;
+          nm = "CANCEL";
         } else {
           nm = "BASE";
           if (judge::baseSet) {
             bg = (judge::baseSrc == judge::SRC_SAV) ? C_BDS : C_ST_OK;   // 青蓝=上电恢复 / 绿=本次设
             fg = CLR_PAPER;                                              // 亮底配深字
+            // ★ v1.12.0(A2):红/琥珀那一刻,把"下一步"指出来 —— 只换键色,
+            //   不改文案、不加字符、不动布局。状态回正常后自然恢复原色。
+            if (judge::res.ph == phrase::PH_POSBAD || judge::res.ph == phrase::PH_DRIFT) {
+              bg = C_ST_OK;                                              // 绿 = 按我
+            }
           }
         }
         break;
@@ -3349,13 +3556,18 @@ inline void drawInteg() {
   if (judge::baseSet) {
     const float lim = tune::posLim();
     const float ofm = judge::res.offsetM;
-    snprintf(b, sizeof(b), "OFF %4.1fm  LIM %.0fm", ofm, lim);
+    // ★ v1.12.0(A3):行尾补 SAV/NEW —— "基准是旧的"是 off 266m 最常见成因
+    //   (上电恢复的基准可能已经放了很多天)。SRC_SET=NEW / SRC_SAV=SAV。
+    snprintf(b, sizeof(b), "OFF %4.1fm  LIM %.0fm %s", ofm, lim,
+             (judge::baseSrc == judge::SRC_SAV) ? "SAV" : "NEW");
     uint16_t oc = CLR_INK;
     if (ofm > lim)            oc = C_ST_POS;      // 越线 = 事实级,红
     else if (integ::slowOn()) oc = C_ST_DRIFT;    // 没越线但在漂 = 趋势级,琥珀
     spr->setTextColor(oc, C_BLOCK);
   } else {
-    snprintf(b, sizeof(b), "OFF  ---  (no base)");
+    // 占位串与真值行**定宽对齐**(原规矩:否则块里留残影)。
+    // 真值最长 = "OFF 999.9m  LIM 99m SAV" = 23 字符,占位串补空格到同宽。
+    snprintf(b, sizeof(b), "OFF  ---  (no base)    ");
     spr->setTextColor(CLR_INK2, C_BLOCK);
   }
   spr->drawString(b, x0, INT_Y + 41);
@@ -3596,6 +3808,14 @@ inline void drawTop(const char* title) {
 inline void drawList() {
   spr->fillSprite(CLR_PAPER);
   drawTop("PARAMS");
+  // ★ v1.12.0(A4):标题行右侧 6 字符落盘状态位 —— 只显示,不改落盘时机
+  //   (tune::commit() 仍在 leave()/backFromTpEdit(),不新增写盘)。
+  //   琥珀 PENDING = 改了还没落盘(此刻拔电=白改);灰 SAVED = 已落盘。
+  spr->setTextFont(2); spr->setTextSize(1);
+  spr->setTextDatum(MR_DATUM);
+  if (dirty) { spr->setTextColor(C_WARN,   C_BLOCK); spr->drawString("PENDING", SCR_W - 8, charts::TOP_H / 2); }
+  else       { spr->setTextColor(CLR_INK2, C_BLOCK); spr->drawString("SAVED",   SCR_W - 8, charts::TOP_H / 2); }
+  spr->setTextDatum(TL_DATUM);
 
   char b[20];
   for (int i = 0; i < kN; ++i) {
@@ -3807,7 +4027,25 @@ struct EventRec {
   uint8_t  closed;                 // 1 = 已恢复正常
   int16_t  offDm;                  // 事件开始时的偏离(0.1 m)
   char     gga[kGgaCap];           // 事件开始那条 GGA 原文
+  // ---- ★ v1.12.0(A9):事件开始瞬间的环境温湿度(SHT30 正式结构设计测的就是环境量;
+  //      台架阶段读数受板身发热影响偏高,只用于相对趋势,不当作环境真值对外报)。
+  //      命名用中性 T/RH:正式结构就是环境量,台架差异是阶段性的,不固化进字段名。
+  int16_t  tC10;                   // 温度 ×10(℃);0x7FFF = 当时没读到
+  uint8_t  rh;                     // 相对湿度(%);0xFF = 当时没读到
+  uint8_t  cause;                  // ★ 预留给任务单② B5 的归因枚举;本批恒写 0,v1.13.0 启用
 };
+// ★ 回执 #2 裁定:cause 与 A9 字段一次迁移(108→112 只迁这一次),不许 v1.13.0 再迁一遍。
+static_assert(sizeof(EventRec) == 112, "EventRec 尺寸变了 —— 载入迁移的分支要同步改");
+
+// v1.10.6 及更早的 108 B 布局(迁移用,字段顺序一字不改)。
+// ★★ 不做迁移 = 500 条历史事件全部读不出来:eventlog::begin() 判据是严格等长,
+//     结构一改旧 blob 全部失配 ⇒ nHave=0 ⇒ 屏上事件列表整个空掉(数据没删,但看不见)。
+struct OldEventRec {
+  uint32_t seq;  char date[6];  uint32_t t0, t1;
+  uint8_t  type, closed;  int16_t offDm;  char gga[kGgaCap];
+};
+static_assert(sizeof(OldEventRec) == 108, "旧 EventRec 布局与迁移分支不符 —— 同步改");
+constexpr size_t kOldEventSize = sizeof(OldEventRec);
 
 static EventRec    pool[kMaxEvt];
 static uint32_t    seqCur = 0;               // 已写入的最大序号
@@ -3873,12 +4111,16 @@ static void keyOf(int i, char* k, size_t n) { snprintf(k, n, "ev%02d", i); }
 inline void saveOne(int slot) {
   char k[8];
   keyOf(slot, k, sizeof(k));
-  prefs.putBytes(k, &pool[slot], sizeof(EventRec));
+  // ★ v1.12.0(A8):写失败不再吞掉 —— 只打印、不重试(重试会在主循环里阻塞
+  //   几十到几百 ms,得不偿失)。这是"以后真出问题能查到"的保险,不是功能改动。
+  if (prefs.putBytes(k, &pool[slot], sizeof(EventRec)) != sizeof(EventRec))
+    Serial.printf("[bench] evt: NVS write FAILED (slot=%d)\n", slot);
 }
 
 inline void saveStat() {
   uint32_t st[6] = { stTotSec, stOnlineSec, stOkSec, stSumSats, stSumCn0x10, stNSats };
-  prefs.putBytes("stat", st, sizeof(st));
+  if (prefs.putBytes("stat", st, sizeof(st)) != sizeof(st))      // ★ v1.12.0(A8) 同上
+    Serial.println("[bench] evt: NVS write FAILED (stat)");
 }
 
 // ---- 开机载入(setup 里调)----
@@ -3903,7 +4145,10 @@ inline void begin() {
   for (uint32_t i = 0; i < n; ++i) {
     char k[8];
     keyOf((int)i, k, sizeof(k));
-    if (prefs.getBytesLength(k) == (int)sizeof(EventRec)) {
+    // ★ v1.12.0(A9):108→112 一次性迁移。只在升级后第一次开机发生一次,
+    //   之后全部走新格式分支,无额外开销。旧记录没有温湿度 → 填"未记录"哨兵。
+    const int len = prefs.getBytesLength(k);
+    if (len == (int)sizeof(EventRec)) {
       prefs.getBytes(k, &pool[i], sizeof(EventRec));
       // ★ v1.10.4(评审 S5):NVS 只校验了长度,内容不可信 —— type 越界虽被
       //   phrase::text()/statusColor565 的 p<PH_COUNT 兜底接住(不会崩,但显示错),
@@ -3912,6 +4157,24 @@ inline void begin() {
       pool[i].gga [sizeof(pool[i].gga)  - 1] = 0;
       pool[i].date[sizeof(pool[i].date) - 1] = 0;
       ++nHave;
+    } else if (len == (int)kOldEventSize) {
+      OldEventRec o;                                       // 旧结构原样复制,字段顺序一字不改
+      if (prefs.getBytes(k, &o, sizeof(o)) == sizeof(o)) {
+        memset(&pool[i], 0, sizeof(EventRec));
+        pool[i].seq = o.seq;  memcpy(pool[i].date, o.date, sizeof(o.date));
+        pool[i].t0 = o.t0;    pool[i].t1 = o.t1;
+        pool[i].type = o.type; pool[i].closed = o.closed; pool[i].offDm = o.offDm;
+        memcpy(pool[i].gga, o.gga, sizeof(o.gga));
+        pool[i].tC10 = (int16_t)0x7FFF;                    // 旧记录没有温湿度 → "未记录"
+        pool[i].rh   = 0xFF;
+        pool[i].cause = 0;                                 // 归因 v1.13.0 才有
+        if (pool[i].type >= (uint8_t)phrase::PH_COUNT) pool[i].type = (uint8_t)phrase::PH_NODATA;
+        pool[i].gga [sizeof(pool[i].gga)  - 1] = 0;
+        pool[i].date[sizeof(pool[i].date) - 1] = 0;
+        saveOne((int)i);                                   // 升格写回,下次走新格式分支
+        ++nHave;
+        Serial.println("[bench] evt: migrated 108 -> 112 (one-time)");
+      }
     }
   }
   // ★ v1.8.4:上次关机时留下的那条"未闭环"记录,重启后不可能还在进行 —— 就地收尾。
@@ -3946,6 +4209,14 @@ inline void startEvent(int type) {
   if (od < 0)    od = 0;
   e.offDm  = (int16_t)od;
   latestGga(e.gga, sizeof(e.gga));
+  // ★ v1.12.0(A9):事件开始瞬间取一次温湿度快照(只在事件开始取,恢复时不取 ——
+  //   一条记录一个点,不做趋势)。用 haveVal && !stale(读到过好值且 6 秒内有新值),
+  //   不用 ok —— ok 是"最近一次读通",刚失败一次就被判死,而 2 秒一读的老值仍有意义。
+  if (sht::haveVal && !sht::stale) {
+    e.tC10 = (int16_t)lroundf(sht::tempC * 10.0f);
+    e.rh   = (uint8_t)lroundf(sht::rhPct);
+  } else { e.tC10 = (int16_t)0x7FFF; e.rh = 0xFF; }
+  e.cause = (uint8_t)judge::res.cause;   // ★ v1.13.0(B5):归因落盘(老记录迁移时 memset 归 0 = ---)
   pool[slot] = e;
 
   saveOne((int)slot);            // ★ 先落"未闭环"一条 —— 掉电也有记录
@@ -3961,6 +4232,17 @@ inline void startEvent(int type) {
 }
 
 // ---- 事件恢复:补写同一条 ----
+// ★ v1.12.0(A11):跨 UTC 零点的时长统一计算 —— 串口 closeEvent 与屏上详情页
+//   两处共用这一个函数,别在两个地方各写一遍(下次改漏一处又会不一致)。
+//   t1 == 0 一律当"未恢复"(与 startEvent 里 e.t1=0 的语义一致,不解释成"午夜整结束")。
+inline uint32_t durOf(const EventRec& e, bool* cross) {
+  if (cross) *cross = false;
+  if (!e.closed || e.t1 == 0) return 0;              // 未恢复 / 关机截断
+  if (e.t1 >= e.t0)          return e.t1 - e.t0;
+  if (cross) *cross = true;
+  return 86400u - e.t0 + e.t1;                       // 跨 UTC 零点
+}
+
 inline void closeEvent() {
   if (curType < 0) return;
   const int slot = (int)((seqCur - 1u) % (uint32_t)kMaxEvt);
@@ -3970,9 +4252,11 @@ inline void closeEvent() {
   saveOne(slot);
   saveStat();
   needPaint = true;
-  const uint32_t dur = (e.t1 >= e.t0) ? (e.t1 - e.t0) : 0;
-  Serial.printf("[evt] CLOSE #%lu %s dur=%lus\n",
-                (unsigned long)e.seq, phrase::text((phrase::PhraseId)e.type), (unsigned long)dur);
+  bool cr = false;
+  const uint32_t dur = durOf(e, &cr);
+  Serial.printf("[evt] CLOSE #%lu %s dur=%lu%s\n",
+                (unsigned long)e.seq, phrase::text((phrase::PhraseId)e.type),
+                (unsigned long)dur, cr ? " +1d" : "");
   curType = -1;
 }
 
@@ -4202,7 +4486,12 @@ inline void paintList() {
       const uint16_t bg = (r & 1) ? 0x10A2 : CLR_PAPER;      // 隔行底色(深灰)
       if (r & 1) spr->fillRect(0, y, SCR_W, kRowH, bg);
       char ln[40];
-      snprintf(ln, sizeof(ln), "%s %02lu:%02lu  %-9s %s",
+      // ★ v1.12.0(A10):补 " UTC" 标记 —— 屏上时钟是北京时、事件时间是 UTC,
+      //   同一块屏上两个时间差 8 小时,只有一个带后缀,人一定怀疑设备错了。
+      //   只加标记不转时区(详情页已标 UTC,两页口径一致)。宽度核算(任务单§A10):
+      //   最宽 "10-23 23:59 UTC  SIG-ABNORMAL OK" = 32 字符 = 192px < 234px 可用。
+      //   若将来状态词加长到 15 字符以上,这条要重算。
+      snprintf(ln, sizeof(ln), "%s %02lu:%02lu UTC  %-9s %s",
                e.date,
                (unsigned long)(e.t0 / 3600u), (unsigned long)((e.t0 / 60u) % 60u),
                phrase::text((phrase::PhraseId)e.type),
@@ -4281,11 +4570,34 @@ inline void paintDetail() {
                          (unsigned long)(e.t1 / 3600u), (unsigned long)((e.t1 / 60u) % 60u));
   else          strcpy(b, "--  (not recovered)");
   spr->drawString(b, 46, y + 28);
-  if (e.closed && e.t1 >= e.t0) snprintf(b, sizeof(b), "%lu s", (unsigned long)(e.t1 - e.t0));
-  else                          strcpy(b, "--");
+  if (e.closed && e.t1 != 0) {                  // ★ v1.12.0(A11):t1==0 一律当"未恢复"
+    bool cr = false;
+    const uint32_t dur = durOf(e, &cr);         // 跨 UTC 零点补 86400,显示 +1d
+    snprintf(b, sizeof(b), "%lu s%s", (unsigned long)dur, cr ? " +1d" : "");
+  } else                                        strcpy(b, "--");
   spr->drawString(b, 46, y + 42);
   snprintf(b, sizeof(b), "%.1f m", e.offDm / 10.0f);
   spr->drawString(b, 46, y + 56);
+  // ★ v1.13.0(B5):归因一行,插在 off 之后。老记录 cause=0 → 显示 "---"(是"当时没记",不是丢数)。
+  spr->setTextColor(CLR_INK2, CLR_PAPER);
+  spr->drawString("cause", 6, y + 70);
+  spr->setTextColor(CLR_INK, CLR_PAPER);
+  strcpy(b, judge::causeName((judge::Cause)e.cause));
+  spr->drawString(b, 46, y + 70);
+  // ★ v1.12.0(A9):温湿度两行,插在 cause 之后(GGA 标题 gy-14=162,行到 y+98=134,不挤)。
+  //   老记录(迁移前)没有温湿度 → 哨兵值显示 "--"(这是"当时没记",不是丢数)。
+  const char* lab2[2] = { "temp", "rh" };
+  for (int i = 0; i < 2; ++i) {
+    spr->setTextColor(CLR_INK2, CLR_PAPER);
+    spr->drawString(lab2[i], 6, y + 84 + i * 14);
+  }
+  spr->setTextColor(CLR_INK, CLR_PAPER);
+  if (e.tC10 != (int16_t)0x7FFF) snprintf(b, sizeof(b), "%.1f C", e.tC10 / 10.0f);
+  else                           strcpy(b, "--");
+  spr->drawString(b, 46, y + 70);
+  if (e.rh != 0xFF) snprintf(b, sizeof(b), "%.0f %%", (float)e.rh);
+  else              strcpy(b, "--");
+  spr->drawString(b, 46, y + 84);
 
   // 下部:GGA 原文(事件开始那条)
   int gy = 176;
@@ -4653,6 +4965,14 @@ constexpr int kSwipePx     = 40;        // 日志页滑动判定:竖直位移达
 constexpr int kDebounce = 350;          // 两次有效点击最小间隔 ms
 constexpr int kTouchWarm = 2000;        // 上电头 2 秒不认触摸(见 poll 里的说明)
 
+// ---- ★ v1.12.0(A14):自动熄屏 + 两步唤醒 参数组(消费电子通用手势;间隔为我方定义) ----
+// ★ v1.12.1(用户 2026-10-24:"手势期间屏幕不要有任何显示,太闪"):砍掉 HINT 低亮提示/
+//   "HOLD 2s" 画面/进度条/渐亮动画 —— 手势全程屏保持全黑,按满 2s 瞬间直接 100% 点亮。
+constexpr uint32_t kSleepAfterMs = 300000;  // 无触摸满 5 min 自动熄屏(用户定)
+constexpr uint32_t kTapMaxMs     = 800;     // 短按:按下 ≤800ms 松开(对齐"短按 1 秒"留余量)
+constexpr uint32_t kWakeGapMs    = 2000;    // ARM 态等第二次按下的窗口(官方只说"立即",2s 为容错)
+constexpr uint32_t kWakeHoldMs   = 2000;    // 第二次按住满 2 s 才真唤醒(防"包装压住 2 秒")
+
 static void loadCal() {
   for (int i = 0; i < 5; ++i) {
     char k[6] = "cal0";
@@ -4702,6 +5022,97 @@ inline void resetCal() {
   Serial.println("[bench] touch: 校准值已清除 —— 重启后重新校准");
 }
 
+// ============================================================================
+//  ★ v1.12.0(A14):自动熄屏(5 min)+ 两步唤醒(短按一下 → 按住 2 s → 全亮)
+//  ★ v1.12.1:两步全程**零显示**(用户:"手势协议没生效前屏幕不用点亮") ——
+//    短按不亮屏、按住 2s 期间不亮屏,按满瞬间直接 100% + 整页重画。
+//    已知代价(用户确认接受):黑屏里短按完全无反馈,外人看像死机。
+//  状态机唯一入口在 poll() 顶部;OFF/ARM 态吞掉一切触摸,页面动作分派不执行
+//  —— 否则盲操作会点中 CLR-BS 长按 5 s 把基准清掉(硬约束 1)。
+//  硬约束:状态变化不唤醒屏(告警只记日志)/ 熄屏时灯一并灭(kLedFollowScreen)/
+//  熄屏停一切推屏(loop 分流统一走 gScreenOff)/ 熄屏不触发任何落盘 /
+//  唤醒后整页重画(GRAM 里是旧帧)。
+// ============================================================================
+enum SlSt : uint8_t { SL_AWAKE = 0, SL_OFF, SL_ARM };
+static SlSt     slSt          = SL_AWAKE;
+static uint32_t slLastTouchMs = 0;      // AWAKE:最后一次触摸时刻(0 = 未初始化)
+static uint32_t slArmMs       = 0;      // 进入 ARM 的时刻(短按完成)
+static uint32_t slHoldStart   = 0;      // 第二次按下的起点
+static bool     slDownSeen    = false;  // 熄屏手势自己的按下沿记忆
+
+// 唤醒后的整页重画:熄屏期间没画,GRAM 是旧帧(可能是 5 分钟前的星图)。
+inline void slFullRepaint() {
+  disp::resetPaintCaches();
+  if (ui::page == ui::PAGE_MAIN)              disp::tick();
+  else if (ui::page == ui::PAGE_CHARTS)       charts::tick();
+  else if (ui::page == ui::PAGE_TUNE ||
+           ui::page == ui::PAGE_TPEDIT)       tune::tick();
+  else                                        eventlog::markDirty();
+}
+
+// 熄屏(真源;手势超时与调试命令都走这里)
+inline void screenSleep() {
+  disp::sleepPanel();                    // 先灯后屏 + gScreenOff=true
+  slSt = SL_OFF;
+  slLastTouchMs = millis();              // 计时起点重置(wake 后第一次自动熄屏不从错起点算)
+  Serial.println("[bench] a14: screen off (tap + hold 2s to wake)");
+}
+
+// 唤醒(真源;★ v1.12.1 起背光 100% 也归这里 —— 唤醒只有一种观感:直接全亮)
+inline void screenWake() {
+  disp::wakePanel();                     // 先屏(SLPOUT+120ms)
+  disp::setBacklight(100);               // 后灯:一步到 100%(无渐亮 —— 用户"闪,不爽")
+  slSt = SL_AWAKE;
+  slLastTouchMs = millis();
+  slFullRepaint();
+}
+
+// ---- 供 loop 每圈调:AWAKE 态 5 min 无触摸自动熄屏 ----
+inline void sleepTick(uint32_t now) {
+  if (gScreenOff || slSt != SL_AWAKE) return;
+  if (slLastTouchMs == 0) { slLastTouchMs = now; return; }   // 首圈先落基准
+  if (now - slLastTouchMs >= kSleepAfterMs) screenSleep();
+}
+
+// ---- OFF/ARM 两态的触摸处理(poll 顶部调用;返回 true = 已吞掉,分派不执行) ----
+// ★ v1.12.1:全程静默 —— OFF 短按进 ARM(不亮屏);ARM 按住满 2s 瞬间全亮;
+//   松手早了/超时 2s 静默回 OFF。屏在整个手势期间保持 SLPIN + 背光 0。
+static void slGesture(uint32_t now, bool down, uint16_t x, uint16_t y) {
+  (void)x; (void)y;
+  if (slSt == SL_OFF) {
+    if (down && !slDownSeen) { slDownSeen = true; slHoldStart = now; }
+    else if (!down && slDownSeen) {
+      slDownSeen = false;
+      // ★ 必须两下:单次长按(>800ms)不唤醒、直接回 OFF —— 防包装压住 2 秒
+      if (now - slHoldStart <= kTapMaxMs) {
+        slSt = SL_ARM;  slArmMs = now;     // 只记状态,不亮屏不画字(零显示)
+        Serial.println("[bench] a14: tap -> armed, hold 2s to wake (silent)");
+      }
+    }
+    return;                                // OFF 态:一律吞掉,不进页面动作
+  }
+  // ---- SL_ARM(屏仍全黑) ----
+  if (down) {
+    if (!slDownSeen) { slDownSeen = true; slHoldStart = now; }
+    if (now - slHoldStart >= kWakeHoldMs) {
+      slDownSeen = false;
+      screenWake();                        // 按满 2s 瞬间:SLEEP OUT → 100% → 整页重画
+      Serial.println("[bench] a14: wake (full repaint)");
+    }
+  } else {
+    if (slDownSeen) slDownSeen = false;    // 没按满 2 s 就松 → 静默回 OFF
+    if (now - slArmMs > kWakeGapMs) screenSleep();    // 2 s 内没再按 → 回黑
+  }
+}
+
+// ---- ★ A14-6b:三条调试命令的入口(P9 实验前置;原子操作,绕过"5min 计时+手势"两层) ----
+//   sleep:停推屏 + SLPIN,背光保持当前值不动 —— P9-c 的"只 SLEEP"对照态
+//   wake :SLPOUT + 120ms + 整页重画,背光不动
+//   bl N :只调背光,不动 gScreenOff、不动屏电源
+inline void dbgSleep() { screenSleep(); }
+inline void dbgWake()  { disp::wakePanel(); slSt = SL_AWAKE; slLastTouchMs = millis(); slFullRepaint(); }
+inline void dbgBl(uint8_t pct) { disp::setBacklight(pct); }
+
 // ★ 2026-10-15:`[[maybe_unused]]` —— 本函数**当前没有任何命令入口**(电脑串口的
 //   命令表里没有它;C3 命令板的 `c = print cal` 指的是 **C3 自己那份**,不是这里)。
 //   保留不删的理由:"校准值打不出来"是排障硬需求 —— 2026-10-15 触摸失灵那天,
@@ -4732,6 +5143,7 @@ static bool     tuneFired = false;  // ★ v1.10.0:本次按压是否已经执�
 //       不是界面被硬切;语义命令做不到这一点。
 //  ★ 安全边界:`k` **不进 linkKeyAllowed() 白名单**(仍 8 个) ⇒ C3 发不进来,
 //    只有电脑 USB 串口能敲。上电 2 s 的 kTouchWarm 闸**照旧生效**(注入走同一条下游)。
+#if ENABLE_INJ          // ★ v1.12.0(A5):整段随编译开关裁掉
 namespace inj {
   // 一次动作 = 从 (x0,y0) 按下、持续 durMs、期间坐标线性走到 (x1,y1)。
   //   点   : 两点相同,durMs = 120
@@ -4785,6 +5197,7 @@ namespace inj {
     return false;
   }
 }  // namespace inj
+#endif                  // ENABLE_INJ
 
 inline bool hitBack(uint16_t x, uint16_t y) {
   return (x >= BACK_X && x < BACK_X + BACK_W && y >= BACK_Y && y < BACK_Y + BACK_H);
@@ -4880,13 +5293,20 @@ inline void handleTap(uint16_t px, uint16_t py, int dx, int dy, uint32_t held) {
       if (disp::cardUp()) { disp::hideWifiCard(); break; }
       if (py >= BTN_Y && py < BTN_Y + BTN_H) {          // 按键条:x 四等分
         switch (px / BTN_W) {
-          case 0:                                        // BASE —— 存基准(★ v1.8.6:P1 门限 + P2 采样)
+          case 0:                                        // BASE —— 存基准;采样中 = CANCEL(★ v1.13.0)
             // 三个入口共用 judge::requestBase():门限不过就拒绝,过了也只是**开始**
             // 10 s 采样,真正的落盘在 judge::sampleStep() 里(那时才写 NVS)。
+            // ★ v1.13.0:采样中再点 = 取消本次采样(不落盘不动基准);串口 b / C3 b
+            //   维持"已在采样中"提示不变 —— 产线工装重复发包不会误取消。
             {
               char m[40] = "";
-              judge::requestBase(m, sizeof(m));
-              wifi10::rptText(m);
+              if (judge::baseSmpOn()) {
+                judge::cancelBaseSample();
+                wifi10::rptText("base sampling cancelled");
+              } else {
+                judge::requestBase(m, sizeof(m));
+                wifi10::rptText(m);
+              }
             }
             disp::resetPaintCaches();                    // 按键底色(BASE 三态/采样进度)+ 星图都要重画
             disp::tick();
@@ -4922,8 +5342,18 @@ inline void poll() {
   // ★★ v1.10.2:**唯一**的注入点 —— 有注入动作时,合成坐标**替代** getTouch 的返回值。
   //   往下所有判据(去抖、两处 5 s 长按、滑动、handleTap)完全不知情,
   //   所以"电脑替手按"与"手指按"走的是同一段代码。
+#if ENABLE_INJ
   bool down = inj::busy() ? inj::sample(now, x, y)
                           : disp::tft.getTouch(&x, &y, kPressure);
+#else
+  bool down = disp::tft.getTouch(&x, &y, kPressure);
+#endif
+
+  // ★★ v1.12.0(A14):熄屏四态机插在**所有页面动作之前** ——
+  //   OFF/ARM 态吞掉一切触摸直接 return(硬约束 1:盲操作不得点中 CLR-BS);
+  //   AWAKE 态有触摸就刷新 5 min 计时。
+  if (slSt != SL_AWAKE) { slGesture(now, down, x, y); return; }
+  if (down) slLastTouchMs = now;
 
   // ★ 上电头 2 秒不认任何触摸 —— 触摸屏和它的 ADC 刚上电时读数不稳,
   //   实测会冒出一个"幽灵点击"。wasDown 初值 true 是第一道闸,这里是第二道,
@@ -6020,7 +6450,34 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //        挡住的是键的下半部,进度条在顶部才看得见。
 //      ⑤ 四键**按压动画**:按下该键内缩 3px 重画,松手弹回 —— 走 btnState
 //        0x80 位 + cBtnSt 去重,不变不画。
-constexpr const char* kVer   = "v1.10.6";
+//   ★ v1.12.0(2026-10-24,任务单-2026-10-23-1「屏幕诚实性小改」A1~A14,回执已裁):
+//      A1 NO-BASE 状态词(枚举追加 PH_DRIFT 之后,历史事件零错位)/ A2 红屏时 BASE 键
+//      变绿 / A3 数据条 SAV/NEW / A4 参数页 PENDING/SAVED / A5 ENABLE_INJ 编译开关 /
+//      A8 事件落盘查返回值 / A9 EventRec 108→112(温湿度+cause 一次迁移,回执 #2)/
+//      A10 列表页补 UTC / A11 跨午夜时长 +1d / A12 e dump CSV 导出(不进白名单)/
+//      A14 自动熄屏 5min + 两步唤醒(BLK 接 GPIO7 后生效;★ 2026-10-24 P9 试接,
+//      TFT_BL_ON_GPIO 0→1,背光 LEDC 调光启用 —— 判据"拉到最低能不能变暗"由 bl 命令实测),
+//      含 sleep/wake/bl 三条调试命令,P9 实验前置)。
+//   ★ v1.12.1(2026-10-24 午,用户拍板的观感修正):两步唤醒改**全程静默** ——
+//      删 12% HINT 低亮/「HOLD 2s」画面/进度条/渐亮动画;短按→按住 2 s 期间屏保持
+//      SLPIN+背光 0,按满瞬间直接 100%+整页重画(无人机开机手势同款:黑屏里没反馈
+//      是特性)。
+//   ★ v1.13.0(2026-10-24 午,任务单-2026-10-23-2「S3 判据归因」B1~B6 + 用户新增交互):
+//      第一纪律:**归因只改"标注",不改"报不报警"** —— overLim/driftOn/holdMs/
+//      recoverMs/posLim 一个字没动。
+//      B1 解析 RMC 拿 sog(多普勒测速,静止判据 0.30 m/s,不进 tune)/
+//      B2 60 s 阶跃检测 STEP(12 格×5 s 环形缓冲,≥8 m 判阶跃,保持 2 min;
+//         设/清基准时缓冲清零 —— 不清会拿旧 off 立刻误判)/
+//      B3 SOL:off < 2×HPL 归"解算精度不足"(照旧报警,只标注)/
+//      B4 MP:mpN≥2 且峰值≥mpThrDb 归"多径"(复用 10 dB 阈值,零新参数)/
+//      B5 cause 枚举(A 批已预留字节)开始写真值:串口 s 加归因行 / 详情页加 cause 行 /
+//         e dump CSV 尾加 cause 列 / 优先级 STEP>MP>SOL /
+//      B6 obs 命令:每 5 s 一行 15 字段观测行(P10 长挂数据集唯一来源;RAM 开关,
+//         重启默认 off;不上屏不进 NVS 不改判定)。
+//      交互:设基准 10 s 采样中,BASE 键面直接显示 **CANCEL**(倒计时数字不再显示,
+//         顶部进度条照走),点它=取消本次采样(不落盘不动基准;串口/C3 的 b 维持
+//         原提示,产线重复发包不误取消)。
+constexpr const char* kVer   = "v1.13.1";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -6267,8 +6724,8 @@ static int      n        = 0;
 static uint32_t nCmd     = 0;              // 累计收到几条合法命令(只用于日志里的序号)
 
 // ★ v1.6.0:对端(C3)协议号 —— 上一次看到的那个值,-1 = 还没见过。
-//   只为**去重**用:心跳每 2 秒一条,协议号却不怎么变 —— 不去重的话
-//   "协议不匹配"那行日志/那条屏上提示会跟着心跳一起每 2 秒刷一遍。
+//   只为**去重**用:心跳每 4 秒一条(★ v1.2.9 起,C3 侧由 2s 翻倍;协议号却不怎么变
+//   —— 不去重的话"协议不匹配"那行日志/那条屏上提示会跟着心跳一起刷一遍)。
 static int      peerProtoSeen = -1;
 
 // ★★ 2026-10-15 新增:链路直通键**白名单**。
@@ -6449,7 +6906,11 @@ inline void poll() {
 }  // namespace benchlink
 
 static void printHelp() {
-  Serial.println("[bench] commands: b=set base  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan  r=reset touch cal  v=event log page  ?=help");
+#if ENABLE_INJ
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan  e=evt dump CSV  o=obs toggle  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+#else
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  w=wifi add/seed/try/list/del/conn/scan  e=evt dump CSV  o=obs toggle  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+#endif
   // v1.5.17:`wadd` 语义变了 —— 现在是"**连上才存**"(不是存了再连);
   //         另加 `wseed <ssid> <pass>` = 只写台账不连(C3 的 PUSH 走这条)。
   // 2026-10-02:删掉 o=panel RGB/BGR 与 n=invert 两条(命令一并删除,屏已调好)。
@@ -6468,6 +6929,8 @@ static void printHelp() {
   //    getTouch 的返回值,下游全是原路径 ⇒ 按键高亮、长按走条、翻页手势都是真的。
   //    **不进 linkKeyAllowed()** —— C3 发不进来,只有电脑 USB 串口能敲。
   //    至此 **17 条**;本行与 README 命令表是同一份清单(电脑端面板已删除,不用再同步)。
+  //  ★ 2026-10-24(v1.12.0):新增 `e`=事件导出 CSV(e dump [N];不进白名单)与
+  //    `sleep`/`wake`/`bl N` 三条熄屏调试命令(A14-6b,P9 实验前置)—— **19 条**。
   // 's' 那行末尾新增 rst / boot / loopMax —— 现场判断"屏不动了"是哪一类问题,见 serialReport 顶部注释。
 }
 
@@ -6476,6 +6939,23 @@ static void printHelp() {
 //   **返回之后**才发(benchlink::poll),rptQ 也是 poll 每圈只排 2 条 ——
 //   在 case 里直接重启,回显和回执会**一起被重启吞掉**。
 static bool gTouchRebootPend = false;
+
+// ★ v1.13.0(B6):obs 观测行开关 —— 纯 RAM,重启默认 off(故意不进 NVS:忘了关无害)。
+static bool     gObsOn     = false;
+static uint32_t gObsLastMs = 0;
+
+// ============================================================================
+//  ★ v1.12.0(A14-6b):控制台字符源 conGet() —— 带预读回放队列
+// ----------------------------------------------------------------------------
+//  为什么要它:sleep / wake / bl 三条**多字符**调试命令的首字母 s / w / b 与
+//  既有单字符命令撞车。预分派必须"取一行、认不出再放回去"——放回靠这个极小队列。
+//  所有取字符处(readConsole / consoleKey 的 k / w / e 凑行器)一律走 conGet(),
+//  队列为空时行为与直接读 Serial 完全一致,零行为变化。
+// ============================================================================
+static char     gConQ[176];               // 回放队列(最长命令 = wadd 176 B)
+static uint8_t  gConQN = 0, gConQPos = 0;
+inline int conAvail() { return (gConQPos < gConQN) ? 1 : Serial.available(); }
+inline int conGet()   { return (gConQPos < gConQN) ? gConQ[gConQPos++] : Serial.read(); }
 
 // 按键分派 —— ★ 2026-10-11 从 readConsole() 里原样抽出,电脑串口与 C3 链路
 // (benchlink)共用这一份。这样"屏上点一下"和"电脑敲一下"行为完全等价,
@@ -6500,6 +6980,12 @@ static void consoleKey(char c) {
       //   白名单也已去掉 'i',C3 更发不进来了。
       case 's': {
         serialReport(true);              // 手动敲的必须立刻出,不受自动节流限制
+        // ★ v1.13.0(B5):归因行 —— sog/静止判定/多径证据,排障时一眼看到"像什么"。
+        Serial.printf("[bench] cause %s  (sog %.2f m/s %s, mpN %d max %.0f dB)\n",
+                      judge::causeName(judge::res.cause),
+                      nmea::st.sogMps,
+                      judge::isStaticNow() ? "static" : "moving",
+                      integ::mpCount(), integ::mpPeak());
         // ★ v1.5.20:两行摘要回 C3(屏上一行 34 列,只能这么短)。原来这条命令
         //   的信息全在 S3 的串口长句里,C3 那边只有一行 "@s ok s" 的空回显。
         char t1[34], t2[34];
@@ -6594,6 +7080,7 @@ static void consoleKey(char c) {
           wifi10::rptText(b); }
         break;
       }
+#if ENABLE_INJ            // ★ v1.12.0(A5):注入命令随编译开关裁掉(关掉时 k 变"未知命令")
       case 'k': {                        // ★ v1.10.2:**演示注入**(电脑替手按屏)
         // 三种形式(整行;凑行方式与 'w' 逐字相同 —— 手敲终端一次回车整行到):
         //   kt <x> <y>                  点一下(120 ms)
@@ -6604,8 +7091,10 @@ static void consoleKey(char c) {
         char ln[64]; int n = 0;
         uint32_t t0 = millis();
         while (millis() - t0 < 100) {
-          if (Serial.available()) {
-            char ch = (char)Serial.read();
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
             if (ch == '\n') break;
             if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
           }
@@ -6638,14 +7127,90 @@ static void consoleKey(char c) {
         Serial.printf(" %dms\n", MS);
         break;
       }
+#endif                    // ENABLE_INJ
+      case 'e': {                        // ★ v1.12.0(A12):事件导出 CSV(只读;不进链路白名单)
+        // 为什么不进白名单:与 k/p/w 同理 —— 数据量大(500 条 ≈ 75 KB),只该由
+        // 电脑 USB 串口触发,不能让 C3 误发一条 75 KB 的导出堵死链路。白名单仍 8 字符。
+        // 敲的是整行("e dump" / "e dump 50"),'e' 已读走,把行尾凑齐再解析。
+        char ln[24]; int n = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 100) {
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
+            if (ch == '\n') break;
+            if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
+          }
+        }
+        ln[n] = 0;
+        const char* p = ln;                    // ★ 烧后实测抓到:'e' 与 "dump" 之间的空格
+        while (*p == ' ') ++p;                 //   会进 ln,不跳过的话 strncmp 永远失配(只回 usage)
+        if (strncmp(p, "dump", 4) != 0) {
+          Serial.println("[bench] e usage: e dump [N]   (CSV;N 缺省 = 全部)");
+          break;
+        }
+        uint32_t want = eventlog::nHave;             // 缺省全量
+        { const char* q = p + 4;
+          while (*q == ' ') ++q;
+          if (*q) { const long v = atol(q);
+                    if (v >= 0 && (uint32_t)v < want) want = (uint32_t)v; } }
+        Serial.printf("[evt] dump %lu rows...\n", (unsigned long)want);
+        // 表头:UTF-8 无 BOM;gga 必须双引号包裹(NMEA 里全是逗号)
+        Serial.println("seq,date,t0_utc,t1_utc,crossday,dur_s,type,closed,off_m,temp_c,rh_pct,gga,cause");
+        for (uint32_t i = 0; i < want; ++i) {
+          const eventlog::EventRec& r = eventlog::at((int)i);   // at(0) = 最新
+          bool cr = false;
+          const uint32_t dur = eventlog::durOf(r, &cr);
+          char t0s[10] = "", t1s[10] = "", tc[16] = "", rh[8] = "";
+          snprintf(t0s, sizeof(t0s), "%02lu:%02lu:%02lu", (unsigned long)(r.t0 / 3600u),
+                   (unsigned long)((r.t0 / 60u) % 60u), (unsigned long)(r.t0 % 60u));
+          if (r.closed && r.t1)
+            snprintf(t1s, sizeof(t1s), "%02lu:%02lu:%02lu", (unsigned long)(r.t1 / 3600u),
+                     (unsigned long)((r.t1 / 60u) % 60u), (unsigned long)(r.t1 % 60u));
+          if (r.tC10 != (int16_t)0x7FFF) snprintf(tc, sizeof(tc), "%.1f", r.tC10 / 10.0f);
+          if (r.rh != 0xFF)              snprintf(rh, sizeof(rh), "%u", (unsigned)r.rh);
+          // dump 中途不调 saveOne / 不改 pool —— 纯只读;每 20 条 yield 防 USB 缓冲积压卡判据
+          // ★ v1.13.0(B5):cause 列加在**最后**(插中间会让已存的 Excel 模板列错位)
+          Serial.printf("%lu,%s,%s,%s,%d,%lu,%s,%d,%.1f,%s,%s,\"%s\",%s\n",
+                        (unsigned long)r.seq, r.date, t0s, t1s, cr ? 1 : 0,
+                        (unsigned long)dur, phrase::text((phrase::PhraseId)r.type),
+                        r.closed ? 1 : 0, r.offDm / 10.0f, tc, rh, r.gga,
+                        judge::causeName((judge::Cause)r.cause));
+          if ((i % 20u) == 19u) yield();
+        }
+        Serial.printf("[evt] dump done (%lu rows)\n", (unsigned long)want);
+        break;
+      }
+      case 'o': {                        // ★ v1.13.0(B6):obs 观测行开关(不进白名单;不进 NVS)
+        // 敲的是整行("obs"),'o' 已读走,凑行尾只为校验拼写 —— 敲错就回 usage。
+        char ln[12]; int n = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 100) {
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
+            if (ch == '\n') break;
+            if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
+          }
+        }
+        ln[n] = 0;
+        if (strcmp(ln, "bs") != 0) { Serial.println("[bench] o usage: obs   (toggle 5s CSV row)"); break; }
+        gObsOn = !gObsOn;
+        Serial.printf("[bench] obs %s (every 5s; RAM only, off after reboot)\n", gObsOn ? "ON" : "off");
+        break;
+      }
       case 'w': {                        // WiFi 子命令:wadd/wlist/wdel/wconn
         // 敲的是整行(如 "wadd myssid pass123"),'w' 已读走,把行尾凑齐再交给 wifi10。
         // 最多等 100ms 凑行 —— 手敲终端回车一次整行就到,凑不满就按已收到的算。
         char ln[140]; int n = 0;
         uint32_t t0 = millis();
         while (millis() - t0 < 100) {
-          if (Serial.available()) {
-            char ch = (char)Serial.read();
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
             if (ch == '\n') break;
             if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
           }
@@ -6667,9 +7232,37 @@ static void consoleKey(char c) {
 //   "还有数据",而 read() 却读不出东西 —— 裸 while 就会卡死在这。
 //   64 个字节对手敲命令绰绰有余(一轮处理不完下一圈接着来),
 //   但主循环绝不会被它锁住。(2026-10-01 晚加的这道保险,抽函数时保留)
+// ★ v1.12.0(A14-6b):先做三条多字符调试命令(sleep/wake/bl)的行级预分派 ——
+//   首字母 s/w/b 与单字符命令撞车。终端/工具整行一次性到达,所以读到首字符时
+//   整行剩余几乎必已在 RX 缓冲;认不出(单字符命令)就整行压回回放队列按原路径走。
 static void readConsole() {
-  for (int guard = 0; guard < 64 && Serial.available(); ++guard) {
-    consoleKey((char)Serial.read());
+  for (int guard = 0; guard < 64 && conAvail(); ++guard) {
+    const char c = (char)conGet();
+    if ((c == 's' || c == 'w' || c == 'b') && conAvail()) {
+      // 收整行(命令总由整行敲入;收到的字符先存,认不出再回放,不丢)
+      char ln[176]; int n = 0;
+      ln[n++] = c;
+      uint32_t t0 = millis();
+      bool gotNl = false;
+      while (millis() - t0 < 20 && !gotNl) {
+        if (conAvail()) {
+          const int chi = conGet();
+          if (chi < 0) continue;
+          const char ch = (char)chi;
+          if (ch == '\n') { gotNl = true; break; }
+          if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
+        }
+      }
+      ln[n] = 0;
+      if (gotNl && !strcmp(ln, "sleep"))      { touch::dbgSleep(); continue; }
+      if (gotNl && !strcmp(ln, "wake"))       { touch::dbgWake();  continue; }
+      if (gotNl && !strncmp(ln, "bl ", 3) && ln[3]) { touch::dbgBl((uint8_t)atoi(ln + 3)); continue; }
+      // 不是这三条:整行压回回放队列,按单字符路径原样处理(w/k 的凑行器会从队列接走)。
+      // ★ Pos 从 1 起:首字符 c 已经由下面的 consoleKey(c) 处理,回放从第 2 个字符开始。
+      gConQN = (uint8_t)n; gConQPos = 1;
+      memcpy(gConQ, ln, (size_t)n);
+    }
+    consoleKey(c);
   }
 }
 
@@ -6926,6 +7519,10 @@ void loop() {
 
   if (now - tLed    > 100) { tLed    = now; led::apply(); }
 
+  // ★ v1.12.0(A14):5 min 无触摸自动熄屏计时(唯一计时点;splash 是阻塞循环、
+  //   校准在 touch::begin 里,loop 不跑 —— 两者天然不计入,符合"进入主界面才算")。
+  touch::sleepTick(now);
+
   // ★ 2026-10-06:按当前页面分流。
   //   动图页独占全屏,主界面那几路刷新**全部停掉** —— 报文窗 sprite 在进页时
   //   已经归还(根本没法画),其余画上去也会立刻被动图页的整帧盖掉,纯属白费 CPU。
@@ -6936,6 +7533,9 @@ void loop() {
   //   第二界面 —— 1s 整屏 tick。
   //   第三/四  —— 400ms 检查(只有 needPaint 才真的重绘)。
   //   各页面的 sprite 互斥申请,峰值内存始终只有一份 153,600B。
+  // ★★ v1.12.0(A14):熄屏期间整段分流**跳过** —— 硬约束 4:只停推屏不省这条,
+  //   SPI 和 CPU 白烧。保留:gnss/nmea/judge/sht/wifi10/benchlink/事件落盘/PPS。
+  if (!gScreenOff) {
   if (ui::page == ui::PAGE_MAIN) {
     // 报文窗节拍:MSG_REFRESH_MS(400ms = 2.5Hz)。只有**签名变了**(有新报文)才真的重画;
     // 而且只有报文窗开着时才推屏 —— 关着时这个函数几乎不花时间。
@@ -6946,7 +7546,34 @@ void loop() {
   } else {
     if (now - tEvt > 400) { tEvt = now; eventlog::tick(ui::page == ui::PAGE_EVT); }
   }
+  }  // !gScreenOff
 
   eventlog::poll();         // ★ v1.7.0:事件记录 + 统计。NVS 写全落在这里(主循环收尾)
+
+  // ★ v1.13.0(B6):obs 观测行 —— 每 5 s 一行 15 字段 CSV,全部取现成变量零新计算。
+  //   P10 长挂 12h 的唯一数据来源,也是"改判据→旧数据离线回放"的地基。
+  //   纪律:不进 NVS、不上屏、**不改判定逻辑** —— 它只是一台打印机。
+  if (gObsOn && now - gObsLastMs >= 5000) {
+    gObsLastMs = now;
+    const bool  fix  = nmea::st.fixValid;
+    const float hplv = (fix && integ::valid()) ? integ::hpl() : -1.0f;
+    const float offv = (fix && judge::baseSet) ? judge::res.offsetM : -1.0f;
+    const float sogv = (fix && nmea::st.sogValid) ? nmea::st.sogMps : -1.0f;
+    const bool  shtOk = sht::haveVal && !sht::stale;
+    Serial.printf("OBS,%lu,%d,%.2f,%.1f,%.1f,%d,%.1f,%.1f,%.2f,%.2f,%s,%s,%.1f,%.1f\n",
+                  (unsigned long)now,
+                  fix ? nmea::st.satsUsed : -1,
+                  fix ? nmea::st.hdop : -1.0f,
+                  (fix && nmea::st.cn0N > 0) ? nmea::st.cn0Median : -1.0f,
+                  (fix && nmea::st.cn0N > 0) ? nmea::st.cn0[nmea::st.cn0N - 1] : -1.0f,
+                  fix ? integ::mpCount() : -1,
+                  fix ? integ::mpPeak() : -1.0f,
+                  hplv, offv, sogv,
+                  fix ? judge::causeName(judge::res.cause) : "---",
+                  judge::res.tag,
+                  shtOk ? sht::tempC : -100.0f,
+                  shtOk ? sht::rhPct : -1.0f);
+  }
+
   serialReport(false);      // 主循环里的自动打印,保持 5 秒一次
 }

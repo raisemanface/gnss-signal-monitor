@@ -793,6 +793,9 @@ inline int  count() { return cnt; }
 // 给 C3 本机菜单(WIFI / C3 / LIST)读列表用 —— 只读,不改行为
 inline const char* ssidAt(int i)  { return (i >= 0 && i < cnt) ? list[i].ssid : ""; }
 inline bool        hasKeyAt(int i){ return (i >= 0 && i < cnt) && list[i].pass[0] != '\0'; }
+// ★ v1.2.8(A7):连接忙的只读口子 —— 扫描/连接互斥用。csBusy 是本命名空间私有,
+//   扫描页(scStart/scRestart)在动本机射频前必须先问它。
+inline bool        connecting()   { return csBusy; }
 // ★ v0.7:给 PUSH 用 —— 推给 S3 要的是**密码原文**,不是 "(key)" 这种提示串
 inline const char* passAt(int i)  { return (i >= 0 && i < cnt) ? list[i].pass : ""; }
 // UI 侧调用的入口(键盘 SAVE / 菜单 CONNECT)
@@ -887,7 +890,10 @@ namespace s3link {
 constexpr int      PIN_RX   = 20;        // ← 接 S3 的 TX(GPIO43)
 constexpr int      PIN_TX   = 21;        // → 接 S3 的 RX(GPIO44)
 constexpr uint32_t kBaud    = 115200;    // ★ v0.7:状态行直接引用它,不再手写字面量
-constexpr uint32_t kOkWinMs = 5000;      // ★ v0.7:多久没收到合法回执就算"链路断了"
+constexpr uint32_t kOkWinMs = 10000;     // ★ v0.7:多久没收到合法回执就算"链路断了"
+                                         //   ★ v1.2.9:5000→10000 —— 心跳已放宽到 4 s 一条,
+                                         //   窗口保持 **2.5 个心跳周期**(5000/2000 的原比例),
+                                         //   判定语义不变:连丢两条心跳才判断。
 // ★ v0.11(2026-10-15)删:这里原来还有一个 `kPollMs = 3000`("自检里等待首次链路的窗口")。
 //   它把**开机自检**变成了"3 秒定生死":窗口一到就写死 `NO LINK (3s)` —— 即使 3 秒后
 //   链路马上就通了,那行**也不会自己变**。C3 先上电、S3 后上电时必现 ⇒ 开机画面上
@@ -983,6 +989,21 @@ inline void sendCmd(const char* payload) {
   Serial1.print(payload);
   Serial1.print('\n');
   ++nSent;
+  // ★ v1.2.8(A6):串口日志密码打码 —— 屏上早已脱敏,这条 tx 日志漏了。
+  //   与 S3 侧 echoMasked() 同规矩:wadd/wseed 只打子命令与 SSID,密码打 ****。
+  char masked[96];
+  const char* sp = strchr(payload, ' ');              // 命令词后的第一个空格
+  if (sp && (!strncmp(payload, "wadd ", 5) || !strncmp(payload, "wseed ", 6))) {
+    const char* pw = strchr(sp + 1, ' ');             // ssid 后的空格 => 其后是密码
+    if (pw) {
+      int k = (int)(pw - payload);
+      if (k > (int)sizeof(masked) - 8) k = (int)sizeof(masked) - 8;
+      memcpy(masked, payload, (size_t)k);
+      strcpy(masked + k, " ****");
+      Serial.printf("[c3] link tx #%lu: %s\n", (unsigned long)nSent, masked);
+      return;
+    }
+  }
   Serial.printf("[c3] link tx #%lu: %s\n", (unsigned long)nSent, payload);
 }
 
@@ -1203,7 +1224,17 @@ constexpr const char* kSub2  = "STUDIO";
 //       evtOpenFlag/sink,后台残留"LOG 页开着"随时劫持回跳 + 偷吃 S3 事件帧;
 //     ② alertClose() 补 MODE_EVT 回退分支 —— LOG 页弹的告警点掉后回 LOG 页
 //       (原落 else 进命令板,同样残留);清理逻辑抽成 evtCleanup() 供任意状态调用。
-constexpr const char* kVer   = "v1.2.7";
+//
+//   ★ v1.2.9(2026-10-24 晨,用户:"心跳有点快,我建议心跳周期增加一倍"):
+//     运行期 `@k ping` 心跳 2000→**4000 ms**(loop 里那一处;自检期 kPingMs=500 不动);
+//     **配套** kOkWinMs 5000→10000 —— 存活窗口保持"2.5 个心跳周期"的原比例,
+//     判定语义不变(连丢两条心跳才判 silent),否则 5s 窗口对 4s 心跳余量只剩 1s,
+//     一次主循环卡顿就会误报橙色 "(S3 silent so far)" 告警。
+//
+//   ★ v1.2.10(2026-10-24 晨二,用户:"呼吸灯还是太快,半周期从一秒延长到两秒"):
+//     呼吸周期 3000→**4000 ms**(kLedPeriodMs;gamma/谷值/颜色全不动,只动节拍);
+//     顺带更正 boot 横幅里漏改的"呼吸 2s"(A13 改 3s 时该处没跟上,现在 4s)。
+constexpr const char* kVer   = "v1.2.10";
 
 constexpr uint32_t kExpandMs = 5000;    // 展开时间下限(与 S3 同)
 constexpr uint32_t kHoldMs   = 2000;    // 定格(与 S3 同)
@@ -2259,6 +2290,14 @@ static bool scLineSink(const char* pl) {
 
 // 起一次扫描。remote=true 走 S3,false 走 C3 自己的射频。
 static void scStart(bool remote) {
+  // ★ v1.2.8(A7):扫描/试连互斥 —— 仅本机射频。连接尝试挂着时 esp_wifi_scan_start
+  //    会被驱动拒绝(-2),旧版表现是"密码对,扫一次就变红":扫描把连接打断/抢失败,
+  //    台账还留下"密码错"标记。remote=true 走 S3 射频,不影响本机连接,不能拦。
+  if (!remote && wifi10::connecting()) {
+    outPush("> WIFI / BUSY: connecting, try later", CLR_ERR);
+    Serial.println("[c3] scan: rejected (local connect in progress)");
+    return;
+  }
   scOpen   = true;
   scRemote = remote;
   scN      = 0;
@@ -2350,6 +2389,12 @@ static void scPick(int i) {
 
 static void scRestart() {
   if (scBusy) return;
+  // ★ v1.2.8(A7):重扫同样要躲开本机连接(它直接动本机射频,与 scStart 同一互斥)
+  if (!scRemote && wifi10::connecting()) {
+    outPush("> WIFI / BUSY: connecting, try later", CLR_ERR);
+    Serial.println("[c3] rescan: rejected (local connect in progress)");
+    return;
+  }
   scN = 0; scPage = 0; scBusy = true; scDone = false; scDirty = false;
   scFail = 0;                                            // ★ v0.8
   scT0 = millis();
@@ -2598,7 +2643,8 @@ static void evtPaintList() {
       const int y = kEvTfaH + r * kEvRowH;
       const uint16_t bg = (r & 1) ? kEvAltBg : CLR_BG;
       if (r & 1) eFill(0, y, SCR_W, kEvRowH, bg);
-      snprintf(ln, sizeof(ln), "%s %02lu:%02lu  %-9s %s",
+      // ★ v1.2.8(A10):补 " UTC" —— 与 S3 列表页同款口径(屏上时钟北京时、事件 UTC)
+      snprintf(ln, sizeof(ln), "%s %02lu:%02lu UTC  %-9s %s",
                e.date, (unsigned long)(e.t0 / 3600u), (unsigned long)((e.t0 / 60u) % 60u),
                e.word, e.closed ? "OK" : "--");
       eFont(1); eSize(1);
@@ -3932,7 +3978,8 @@ static void tick() {
     //   · **只在边沿推一次**:断着期间不重复刷屏;链路恢复后再断,会再出现一次。
     //   · `wasOk` 初值 **false** ⇒ 开机时链路本来就还没建立(从没通过),不会误报首条。
     //     "开机就没连上"那件事由开机自检的三行负责(NO LINK (retrying)),不归这里管。
-    //   · `s3link::ok()` 是 **5 秒窗口** ⇒ 心跳停约 5 秒才判 silent,与状态行同一判据,不会打架。
+    //   · `s3link::ok()` 是 **10 秒窗口**(★ v1.2.9,随心跳 2s→4s 等比放大)⇒ 心跳停约
+    //     10 秒(连丢两条)才判 silent,与状态行同一判据,不会打架。
     //   · 屏上不在命令板时(扫描页/键盘页/校准屏)只入队不重绘 —— 等回到命令板,
     //     drawBoardScreen() 整屏重绘时那行自然就在了。
     static bool wasOk = false;
@@ -4123,7 +4170,7 @@ void setup() {
   //   写死必漂 ⇒ 一律占位符。改完务必扫:
   //     grep -nE '"[^"]*v[01]\.[0-9]' firmware/*/*.ino
   //   除 kVer 与本行(已是 %s)外,应当只剩注释里的历史版本号。
-  Serial.printf("[c3] boot ok (%s: 板载 RGB(GPIO8)呼吸灯 —— 链路活=青蓝呼吸 2s/断=红常亮,"
+  Serial.printf("[c3] boot ok (%s: 板载 RGB(GPIO8)呼吸灯 —— 链路活=青蓝呼吸 4s/断=红常亮,"
                 "neopixelWrite 内置 RMT 零新依赖);协议 **P2**(与 S3 同代)",
                 splash::kVer);
   Serial.println();
@@ -4150,26 +4197,40 @@ void loop() {
   //   ⚠ 不能用 w 开头的词(会进 wifi10::cmd());也不能发空 payload(S3 直接丢、不回执)。
   //   ⚠ PUSH 传输中不插心跳,免得与"多行台账"在 S3 侧交错。
   static uint32_t tPing = 0;
-  if (millis() - tPing >= 2000) {
+  // ★ v1.2.9(用户 2026-10-24:"心跳有点快,周期增加一倍"):2 s → 4 s。
+  //   ⚠ 配套改动:kOkWinMs 5000→10000(见那条注释)—— 存活窗口必须仍是
+  //   2.5 个心跳周期,不然一次循环卡顿就会误报断链告警。
+  if (millis() - tPing >= 4000) {
     tPing = millis();
     if (!ui::pushActive) s3link::sendPing();        // ★ v1.1.0:心跳带协议号(见 sendPing)
                                                     // ⚠ 必须带 ui:: / s3link:: 限定 ——
                                                     //   这里是全局 loop(),不带会编译不过
   }
 
-  // 板载 RGB 呼吸灯(★ v1.2.6):链路活 = 青蓝呼吸(周期 2 s,与上方 @k ping 同拍);
-  //   链路断 = 红常亮。20 ms 步进(50 fps 足够顺滑,RMT 负载可忽略)。
+  // 板载 RGB 呼吸灯(★ v1.2.6 引入;★ v1.2.8(A13) 修两个缺陷):
+  //   链路活 = 青蓝呼吸;链路断 = 红常亮。20 ms 步进(50 fps 足够顺滑,RMT 负载可忽略)。
   //   ★ lastOk 初值 true ⇒ 开机若链路未通,先亮一次红(与屏上 `--` 同刻出现),
   //     首条合法回执把它切进青蓝呼吸。
+  //   修的什么(A13,用户 2026-10-23 报"效果不明显、没有完全熄灭"):
+  //     ① 相位常量 0.00031415927 = 2π/20000,比 2π/3000 小一个数量级 —— 2 s 内相位
+  //        只走 36°,亮度全程只在 5%~14% ⇒ "效果不明显";且相位每 2 s 归零时 cos
+  //        从 0.809 跳回 1.000,每 2 秒一次微闪。
+  //     ② 谷值写死 0.05 ⇒ 谷值 RGB=(0,8,12),暗处肉眼可见 ⇒ "永不熄灭"。
+  //   改法(任务单 §A13):周期 3 s(2 s 偏快,人眼读成"脉动");谷值真 0;
+  //   gamma≈2.0(平方)把时间更多分给暗段 —— 这才是"呼吸"的观感来源。
+  //   ★ v1.2.10(用户 2026-10-24:"从熄灭到最亮大概一秒,延长到两秒"):周期 3s → 4s
+  //     (半周期 2s;gamma/谷值/颜色不动 —— 只动节拍,不动观感曲线)。
   static uint32_t tLed  = 0;
   static bool     lastOk = true;
   if (millis() - tLed >= 20) {
     tLed  = millis();
     bool ok = s3link::ok();
     if (ok) {
-      // 正弦呼吸:0.05..1.0,cos 起止都在谷值,亮暗过渡自然无跳变
-      float ph = (float)(millis() % 2000) * 0.00031415927f;   // 2π / 2000ms
-      float s  = 0.05f + 0.95f * (0.5f - 0.5f * cosf(ph));
+      static constexpr float kLedPeriodMs = 4000.0f;
+      static constexpr float kLedTwoPi    = 6.2831853f;
+      float ph  = (float)(millis() % (uint32_t)kLedPeriodMs) * (kLedTwoPi / kLedPeriodMs);
+      float raw = 0.5f - 0.5f * cosf(ph);   // 0 .. 1,谷值真 0
+      float s   = raw * raw;                // gamma ≈ 2.0:暗段停留更久,呼吸感来源
       neopixelWrite(8, 0, (uint8_t)(160.0f * s), (uint8_t)(255.0f * s));
     } else if (lastOk) {
       neopixelWrite(8, 255, 0, 0);    // 刚断:只写一次红,之后保持

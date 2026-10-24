@@ -72,12 +72,12 @@
 //   (S3 与 ESP32 的默认 SPI 端口选择规则不同,库的自动选择在 3.x 核心上会落到错的口)
 #define USE_FSPI_PORT
 
-// ★ 背光 —— 本项目**不要定义 TFT_BL**。
-//   屏的 BLK 直接接 3.3V 常亮,不占 IO;GPIO7 已经给 SHT30 当 I2C 的 SCL 了。
-//   一旦在这里定义 TFT_BL,TFT_eSPI 初始化时会把 GPIO7 设成输出并拉高,和 I2C 抢这条线。
-//   只有背光确实由 GPIO 控制的项目,才打开下面两行。
-//#define TFT_BL     7
-//#define TFT_BACKLIGHT_ON HIGH     // 若背光是低电平点亮,改成 LOW
+// ★ 背光(★ 2026-10-24 起由 GPIO7 驱动 —— P9 实测后用户拍板"试一试"):
+//   BLK 经杜邦线接 GPIO7,固件 disp::begin() 里 ledcAttach 接管调光(5kHz/8bit)。
+//   历史(2026-10-22 重排时):GPIO7 曾给 SHT30 当 SCL,现已挪去 GPIO9,本脚空闲。
+//   ⚠ 别把 TFT_BL 改成 8/9 —— 8=GNSS TXD,9=SHT SCL,static_assert 会拦但别去撞。
+#define TFT_BL     7
+#define TFT_BACKLIGHT_ON HIGH     // 上电默认亮;调光由固件 LEDC 接管,此值只在库 init 时用一次
 
 // ---------------- 触摸(XPT2046) ----------------
 // 想用触屏就保留下面这两行;不想用就注释掉,同时把固件里 ENABLE_TOUCH 改 0。
