@@ -3391,6 +3391,8 @@ static char     cDat[32]   = "";                 // 数据条右侧 HPL/CN0/SAT 
 static uint8_t  cBtnSt[4]  = {0xFF,0xFF,0xFF,0xFF};
 static uint32_t cMsgSig    = 0xFFFFFFFF;
 static uint8_t  cWifiSt    = 0xFF;
+static int8_t   cWifiBars  = -1;      // ★ 2026-10-30:信号档位 1..4;-1 = 未连接/还没算过
+static int32_t  sRssiEma10 = 0;       // ★ 2026-10-30:RSSI 指数平滑(定点 ×10;0 = 未初始化)
 static uint32_t tHud = 0, tDat = 0, tWifi = 0;
 static uint8_t  madctlNow  = 0;
 
@@ -3593,17 +3595,41 @@ static const int kHudY[4] = { HUD_YT, HUD_YT, HUD_YB, HUD_YB };
 //   必须回头核对 HUD_W 的余量与温湿度两行文字(当前文字占 x 150..198,图标起于 212)。
 // ★ 调用顺序硬约束:必须在四角块**填充之后**画,否则被块的填充整块盖掉;
 //   擦除色也是因此从页底 CLR_PAPER 换成块底 C_BLOCK(画错底色会在块上留一条黑弧痕)。
+// ---- ★ 2026-10-30:信号档位(1..4 段),绝对门限 + 3 dB 滞回 ----
+//   背景:原实现只判"连没连上"(st 二值),4 段弧**恒定全画** ——
+//   信号从 -50 dBm 掉到 -85 dBm,只要还连着,屏上仍是满格,与手机习惯相反。
+//   门限:-50 / -65 / -75,-85 以下但还连着 → 1 段(不显示成"无信号")。
+//   滞回:升档要超过门限 +3 dB、降档要低于门限 -3 dB。
+//     RSSI 抖动 ±3~5 dB 是常态,没有滞回会在边界上来回跳格(1 秒一跳)。
+static int8_t wifiBarsHyst(int rssi, int8_t prev) {
+  int8_t raw = 1;
+  if      (rssi >= -50) raw = 4;
+  else if (rssi >= -65) raw = 3;
+  else if (rssi >= -75) raw = 2;
+  if (prev < 1 || prev > 4 || raw == prev) return raw;
+  //   upThr[n] = 升到 n 档所需的最低 RSSI(下标 2..4 有意义)
+  static const int16_t upThr[5] = { 0, 0, -75, -65, -50 };
+  if (raw > prev) return (rssi >= upThr[raw] + 3) ? raw : prev;   // 升档要更硬
+  return (rssi < upThr[prev] - 3) ? raw : prev;                   // 降档同理
+}
+
 static void wifiIconPaint() {
-  const uint8_t  st  = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
-  const uint16_t col = st ? 0x064A : 0x4208;     // 0x064A = #00CB52 翠绿 / 深灰
+  const bool     up  = (WiFi.status() == WL_CONNECTED);
+  const uint16_t col = up ? 0x064A : 0x4208;     // 0x064A = #00CB52 翠绿 / 深灰
   // 右上块 = x HUD_XR..HUD_XR+HUD_W-1 / y HUD_YT..HUD_YT+HUD_H-1
   // 水平:图标右端贴块右边距 4px -> cx = HUD_XR + HUD_W - 4 - 11 = 223(图标占 212..234)
   // 竖直:135°..225° 的弧只在上半,弧心即图标**底端** -> cy = HUD_YT + (HUD_H+11)/2 = 19
   const int16_t  cx = HUD_XR + HUD_W - 4 - 11;
   const int16_t  cy = HUD_YT + (HUD_H + 11) / 2;
   const int16_t  radii[4] = {2, 5, 8, 11};
+  // 未连接:4 段全灰(与旧版一致 —— "灰满格"是"无连接"的既有视觉,不改);
+  // 已连接:只点亮前 bars 段,其余**擦成块底色**。不画暗弧 —— 22x11 里暗弧会糊成一坨。
+  // bars 由 1 Hz 巡检算好写进 cWifiBars(带滞回);这里只读,不重新算 ——
+  //   否则 paintSky 每重画一次就推进一次滞回,加档速度会翻倍、滞回形同虚设。
+  const int      bars = up ? ((cWifiBars >= 1) ? cWifiBars : 4) : 4;
   for (int i = 0; i < 4; ++i)
-    skySpr->drawArc(cx, cy, radii[i], radii[i] - 1, 135, 225, col, C_BLOCK);
+    skySpr->drawArc(cx, cy, radii[i], radii[i] - 1, 135, 225,
+                    (i < bars) ? col : C_BLOCK, C_BLOCK);
 }
 
 // 前置声明(定义在下面):收卡时要立刻重画星空 —— 见 hideWifiCard。
@@ -4055,11 +4081,36 @@ inline void tick() {
     if (memcmp(bs, cBtnSt, 4) != 0) { memcpy(cBtnSt, bs, 4); bot = true; }
   }
 
-  // ---- ⑥ WiFi 图标(1Hz 巡检,状态真的变了才重画)----
+  // ---- ⑥ WiFi 图标(1Hz 巡检,连接状态**或信号档位**变了才重画)----
+  //   ★ 2026-10-30:原来只比 ws(连没连上),现在连档位一起比 ——
+  //     RSSI 掉一档而连接没断时,图标必须跟着变,否则这项改动等于没上屏。
   if (now - tWifi >= 1000) {
     tWifi = now;
     const uint8_t ws = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
-    if (ws != cWifiSt) { cWifiSt = ws; sky = true; }
+    int8_t wb = -1;
+    int    rs = 0, sm = 0;
+    if (ws) {
+      rs = (int)WiFi.RSSI();
+      // ★★ 先平滑再分档。实测这付天线 1 Hz 采到的 RSSI 在 -62~-69 之间跳(7 dB,
+      //    多径 + 板载天线弱),光靠 3 dB 滞回 40 s 内仍跳 3 次,图标肉眼可见地闪。
+      //    EMA α=1/5(1 Hz 下 τ≈5 s)—— 手机的信号格也是"先平滑再分档",不是直接吃瞬时值。
+      //    定点 ×10:整数核上不引浮点;除法的 ±1 dB 误差对分档没有意义。
+      if (sRssiEma10 == 0) sRssiEma10 = rs * 10;
+      else                 sRssiEma10 += (rs * 10 - sRssiEma10) / 5;
+      sm = (sRssiEma10 + 5) / 10;                    // 四舍五入回 dBm
+      wb = wifiBarsHyst(sm, cWifiBars);
+    } else {
+      sRssiEma10 = 0;                                // 断开就丢平滑值,重连从新值起步
+    }
+    if (ws != cWifiSt || wb != cWifiBars) {
+      cWifiSt = ws; cWifiBars = wb; sky = true;
+      // ★ 2026-10-30:档位是"只在屏上看得见"的量,这里补一行串口 ——
+      //   ① 改判据/门槛时能对着实际 RSSI 核;② 现场不用盯屏就能知道图标几格。
+      //   只在**变化**时打(1 Hz 巡检里无条件打会刷屏)。瞬时值与平滑值一起打,
+      //   方便事后判断"是信号真变了,还是平滑还没跟上"。
+      if (ws) Serial.printf("[wifi] icon %d bar(s), rssi %d (smooth %d)\n", (int)wb, rs, sm);
+      else    Serial.println("[wifi] icon: STA off (4 grey bars)");
+    }
   }
 
   // ---- ⑦ WiFi 信息卡(★ v1.7.2:点右上角图标弹出,到点自动收)----
@@ -4087,6 +4138,8 @@ inline void resetPaintCaches() {
   cBtnSt[0] = cBtnSt[1] = cBtnSt[2] = cBtnSt[3] = 0xFF;
   cMsgSig   = 0xFFFFFFFF;
   cWifiSt   = 0xFF;
+  cWifiBars = -1;                        // ★ 下一拍按真实 RSSI 重算,不沿用切页前的档位
+  sRssiEma10 = 0;                        // ★ 平滑也一起清 —— 否则切页后第一格用旧 EMA 起步
   tHud = tDat = tWifi = 0;
   // ★ v1.7.2:WiFi 信息卡也一起收掉 —— 本函数的语义是"下一拍整屏重画一遍",
   //   留着 cardUntil / cardShown 会让卡片在"切页来回一趟"之后莫名其妙又冒出来。
@@ -7388,7 +7441,7 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      ③ 发送绝不阻塞主循环(失败只计数丢弃,不重试不 delay);④ WiFi 未连时全静默。
 //      包格式 W1,OBS/EVT/HB/SKY/STA —— OBS 与 `o dump` 逐列同构,回放脚本不用改。
 //      ⚠ 北斗不进 SKY 包:本模块 GSV 不报 el/az,是数据事实不是漏发。
-constexpr const char* kVer   = "v1.14.5";
+constexpr const char* kVer   = "v1.14.6";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)

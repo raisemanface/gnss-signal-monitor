@@ -1234,7 +1234,7 @@ constexpr const char* kSub2  = "STUDIO";
 //   ★ v1.2.10(2026-10-24 晨二,用户:"呼吸灯还是太快,半周期从一秒延长到两秒"):
 //     呼吸周期 3000→**4000 ms**(kLedPeriodMs;gamma/谷值/颜色全不动,只动节拍);
 //     顺带更正 boot 横幅里漏改的"呼吸 2s"(A13 改 3s 时该处没跟上,现在 4s)。
-constexpr const char* kVer   = "v1.2.10";
+constexpr const char* kVer   = "v1.2.11";
 
 constexpr uint32_t kExpandMs = 5000;    // 展开时间下限(与 S3 同)
 constexpr uint32_t kHoldMs   = 2000;    // 定格(与 S3 同)
@@ -1630,14 +1630,51 @@ static char     lastPayload[96] = "";     // RESEND 键:记住最近一条发往
 // ============================================================================
 //  基础绘制件
 // ============================================================================
+// ---- ★ 2026-10-30:信号档位(1..4 段),与 S3 **同一套门限与滞回** ----
+//   原实现只判"连没连上",4 段弧恒定全画 —— 信号再差也显示满格。
+//   C3 这一版暂不烧录;改动与 S3 对称,哪天烧上去两边视觉才一致。
+//   门限:-50 / -65 / -75,-85 以下但还连着 → 1 段。
+//   滞回:升档 +3 dB、降档 -3 dB(理由见 S3 侧同名函数那段注释:RSSI 抖动 ±3~5 dB)。
+static int8_t  c3IconBars  = -1;
+static int32_t c3RssiEma10 = 0;      // RSSI 指数平滑(定点 ×10;0 = 未初始化)
+
+static int8_t c3WifiBarsHyst(int rssi, int8_t prev) {
+  int8_t raw = 1;
+  if      (rssi >= -50) raw = 4;
+  else if (rssi >= -65) raw = 3;
+  else if (rssi >= -75) raw = 2;
+  if (prev < 1 || prev > 4 || raw == prev) return raw;
+  static const int16_t upThr[5] = { 0, 0, -75, -65, -50 };   // upThr[n] = 升到 n 档的最低 RSSI
+  if (raw > prev) return (rssi >= upThr[raw] + 3) ? raw : prev;
+  return (rssi < upThr[prev] - 3) ? raw : prev;
+}
+
 static void drawWifiIcon(uint16_t bg) {
-  uint16_t color = (WiFi.status() == WL_CONNECTED) ? TFT_CYAN : TFT_DARKGREY;
-  const int16_t cx = ICON_X + 8;
-  const int16_t cy = ICON_Y + ICON_H - 1;
-  const int16_t radii[4] = { 1, 5, 9, 13 };
+  const bool     up    = (WiFi.status() == WL_CONNECTED);
+  const uint16_t color = up ? TFT_CYAN : TFT_DARKGREY;
+  // tick() 每秒调一次本函数 —— 档位就在这里推进(带滞回)。
+  //   drawTopBar() 等处也会调,多算几次无害:prev 已更新,raw == prev 直接返回。
+  //   ★ 与 S3 同款:先 EMA 平滑(α=1/5,1 Hz 下 τ≈5 s)再分档 ——
+  //     实测 S3 那付天线瞬时 RSSI 波动可达 7 dB,只靠滞回图标仍会闪。
+  if (up) {
+    const int rs = (int)WiFi.RSSI();
+    if (c3RssiEma10 == 0) c3RssiEma10 = rs * 10;
+    else                  c3RssiEma10 += (rs * 10 - c3RssiEma10) / 5;
+    const int sm = (c3RssiEma10 + 5) / 10;               // 四舍五入回 dBm
+    c3IconBars = c3WifiBarsHyst(sm, c3IconBars);
+  } else {
+    c3IconBars  = -1;
+    c3RssiEma10 = 0;                                     // 断开就丢平滑值
+  }
+  // 未连接:4 段全灰(保持"灰满格 = 无连接"的既有视觉);
+  // 已连接:只点亮前 bars 段,其余擦成顶栏底色 bg。
+  const int      bars  = up ? ((c3IconBars >= 1) ? c3IconBars : 4) : 4;
+  const int16_t  cx    = ICON_X + 8;
+  const int16_t  cy    = ICON_Y + ICON_H - 1;
+  const int16_t  radii[4] = { 1, 5, 9, 13 };
   for (int i = 0; i < 4; ++i) {
     const int16_t r = radii[i], ir = r - 1;             // 厚 1px
-    tft.drawArc(cx, cy, r, ir, 135, 225, color, bg);
+    tft.drawArc(cx, cy, r, ir, 135, 225, (i < bars) ? color : bg, bg);
   }
 }
 
