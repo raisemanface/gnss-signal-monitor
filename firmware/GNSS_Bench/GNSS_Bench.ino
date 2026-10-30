@@ -173,9 +173,11 @@
 #include <Wire.h>            // SHT30 温湿度走 I2C,核心自带,不用装库
 #include <esp_system.h>      // esp_reset_reason():查"这次开机是被谁弄醒的"(见第 5 段)
 #include <WiFi.h>             // v1.5.6:WiFi 存档/连接(核心自带)
+#include <WiFiUdp.h>          // ★ v1.14.5:UDP 推流到 PC 看板(核心自带,零第三方)
 #include <esp_heap_caps.h>   // v1.5.16:heap_caps_get_largest_free_block —— 临时内存探针用
 #include <esp_wifi.h>        // v1.5.16:esp_wifi_deinit() —— 扫描收摊时真正释放射频驱动内存
 #include <Preferences.h>
+#include <LittleFS.h>        // ★ v1.14.1:obs 观测流落盘(挂 spiffs 分区 8.875 MB)。核心自带,零第三方
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,6 +222,14 @@
 constexpr int PIN_GNSS_RX    = 18;   // ESP32-S3 U1RXD(官方焊盘,J1-11) <-- 模块 TXD
 constexpr int PIN_GNSS_TX    = 17;   // ESP32-S3 U1TXD(官方焊盘,J1-10) --> 模块 RXD(只收不发可不接)
 constexpr int PIN_GNSS_PPS   = 16;   // 模块 PPS(1Hz 秒脉冲) --> 用于校时/驯服,见 pps 段
+
+// ---- DS3231 RTC 的 SQW 1Hz ----
+// ★ v1.14.0:必须与 PPS 分两个脚、各进各的中断 —— 这是整套方案的地基。
+//   合到一路(或让 SQW 顶替 PPS)就等于"让备份顶掉尺子":GNSS 的 PPS 一丢,
+//   中断里照样每秒有沿,检测器永远以为 PPS 是好的 —— 和"哨兵从不报警"
+//   是同一条死法。接线表 v2.3 §2.4。
+//   选 15 的理由:紧挨 PPS(16)与 GNSS 那组,五根线全落 J1-8~15 一小片。
+constexpr int PIN_DS3231_SQW = 15;   // DS3231 SQW(1Hz 方波) --> 与 PPS 的相位差,见 ds3231 段
 
 // ---- 屏幕 ----
 // ★ 这里不写死脚号,直接引用 User_Setup.h 里的宏(已随上面的 <TFT_eSPI.h> include 进来)。
@@ -307,6 +317,19 @@ static_assert(TFT_BL != PIN_SHT_SCL,
 // PPS 是中断输入脚,和 I2C 的两条线不能撞(撞了秒脉冲会打断 I2C 时序,读数开始随机失败)。
 static_assert(PIN_GNSS_PPS != PIN_SHT_SCL && PIN_GNSS_PPS != PIN_SHT_SDA,
               "PPS 脚和 SHT30 的 I2C 线(SCL=9 / SDA=8)撞了 —— 秒脉冲会打乱 I2C 时序。换个脚接 PPS。");
+
+// ★ v1.14.0:SQW 是**第二个**中断脚,三条规矩一起写死在这里。
+//   ① 不许撞 PPS —— 撞了就是"备份顶掉尺子",GNSS 失锁也照样每秒有沿;
+//   ② 不许撞 I2C —— 同上,SQW 沿会打断 I2C 时序;
+//   ③ 不许撞 TFT_BL —— 那会让背光一秒钟闪一次(而且 ISR 里读不到屏)。
+static_assert(PIN_DS3231_SQW != PIN_GNSS_PPS,
+              "DS3231 的 SQW 和 GNSS PPS 接了同一个脚 —— 等于让备份顶替尺子(PPS 丢了也照样有沿)。必须分两个脚。");
+static_assert(PIN_DS3231_SQW != PIN_SHT_SCL && PIN_DS3231_SQW != PIN_SHT_SDA,
+              "DS3231 的 SQW 和 I2C 线撞了 —— 秒脉冲会打乱 I2C 时序。换个脚。");
+#if defined(TFT_BL)
+static_assert(PIN_DS3231_SQW != TFT_BL,
+              "DS3231 的 SQW 撞上了背光脚 —— 背光会每秒闪一次。换个脚。");
+#endif
 
 // ---------------- 板载 WS2812 彩色灯 ----------------
 // ★ 先纠正一个常见误解:板载彩灯**是占一个 GPIO 的**,不是"不占 IO"。
@@ -909,6 +932,20 @@ inline void begin() {
 }
 
 inline uint32_t pulses() { return edgeCount; }
+
+// ★ v1.14.0:最近一个沿的本地时刻(micros 基准)—— 唯一消费者是 clk::phaseUs()
+//   (DS3231 的 SQW 与 PPS 的相位差)。加锁读:32 位读在 ISR 里可能被打断。
+inline uint32_t lastEdgeUsRead() {
+  uint32_t v;
+  noInterrupts(); v = lastEdgeUs; interrupts();
+  return v;
+}
+// 沿计数 + 最近沿时刻一起取(相位差要用"两边都新鲜"做闸门)
+inline uint32_t edgeCountRead() {
+  uint32_t v;
+  noInterrupts(); v = edgeCount; interrupts();
+  return v;
+}
 
 // 积分结果 —— **这才是能当结论的 ppm**。
 // 单次间隔只有 1us 分辨率(±1ppm 量化噪声),把自开机以来所有拍累加起来平均,
@@ -2536,6 +2573,784 @@ static void heapDump(const char* tag);   // 定义在下面(disp::ensureMain 要
 //   若在前置声明里重复写一遍 kMax 就成了**两处手抄同一个常量** —— 正是本项目最忌讳的错。
 namespace wifi10 { inline int savedCount(); inline int capacity(); }
 
+// ---- 日期工具(★ v1.14.0:从 disp 段搬到全局 —— clk 的跨日进位也要用;
+//      static 函数同属一个编译单元,disp 段照旧能调,行为不变) ----
+static bool isLeapYear(int y) { return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0); }
+static int  daysInMonth(int y, int m) {
+  static const int dm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m == 2 && isLeapYear(y)) return 29;
+  return dm[m - 1];
+}
+
+// ============================================================================
+//  第 3.6 段:DS3231 RTC(I2C 0x68)+ 统一时间出口 clk  ★ v1.14.0
+//
+//  为什么要有这一段:现在的"现在几点"只有 GNSS 一个来源(ZDA 报文),
+//  GNSS 一失锁,时间戳就断流 —— 干扰事件"何时发生"反而记不下来。
+//  DS3231 带电池、断主电也走时,把这段时间撑住。**方向永远是 GNSS 教它**,
+//  不是它替代 GNSS。
+//
+//  三条不可越的线(写在这里防以后改坏):
+//   ① SQW 走独立 GPIO15,**绝不与 PPS(GPIO16)合流**,也绝不顶替 PPS。
+//      理由:合流 = 让备份顶掉尺子。PPS 丢了中断里照样每秒有沿,
+//      检测器就永远"看得到秒",这正是"哨兵从不报警"那条死法的翻版。
+//   ② 时间的锚点只用 ZDA 的秒,**不用 PPS**。PPS 是我们要监视的对象;
+//      拿它当锚,它被欺骗时时间会一起错,而对照检测看到的却是"两边一致"。
+//   ③ 校准写 DS3231 时,**秒已经对就不写秒寄存器**。DS3231 写秒会复位
+//      内部 1 Hz 分频链,SQW 相位跟着跳 —— 相位差曲线就废了。
+//      2 ppm 的钟 60 s 只漂 0.12 ms,秒根本不会错,所以稳态下永远是软写。
+//
+//  精度诚实说明:DS3231 = ±2 ppm(≈ 每小时 7.2 ms、每天 173 ms)。
+//  它撑得起"秒数不断档 + ms 级不确定度",撑不起"PPS 级保持"。
+//  想做到后者要 OCXO,不是这颗芯片的事。
+// ============================================================================
+namespace ds3231 {
+
+static const uint8_t kAddr = 0x68;   // ZS-042 模块固定地址(SQW/INT 不占地址位)
+
+static bool     present = false;     // I2C 上到底有没有这颗芯片(开机探一次)
+static bool     valid   = false;     // 里面的时间可信(没掉过电 + 年份合理)
+static bool     osf     = false;     // OSF 振荡器停标志 = 掉过电,时间不可信
+static uint32_t lastMs  = 0;         // 主循环节流(1 s 读一次时间)
+static uint32_t lastTempMs = 0;
+static int      failCnt = 0;
+static uint32_t rdErr   = 0;         // 读失败累计(诊断;0 才叫"总线干净")
+static uint32_t wrCnt   = 0;         // 校准写入总次数
+static uint32_t wrHard  = 0;         // 其中"连秒一起写"的次数(= SQW 相位被打断的次数)
+static float    tempC   = 0.0f;
+static bool     tempOk  = false;
+
+// SQW 1 Hz 中断(独立脚,永不与 PPS 合流)
+static volatile uint32_t sqwEdgeUs = 0;
+static volatile uint32_t sqwCount  = 0;
+
+// ★ IRAM_ATTR 的理由与 pps::onEdge 逐字相同:写 NVS 期间 flash cache 被禁,
+//   此时来一个中断、指令还在 flash 里 -> 直接 panic。本 ISR 只摸 .bss 里的变量。
+void IRAM_ATTR onSqw() {
+  sqwEdgeUs = micros();
+  sqwCount  = sqwCount + 1;          // volatile 上不用 ++(C++20 起弃用)
+}
+
+inline uint8_t bcd2bin(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
+inline uint8_t bin2bcd(uint8_t b) { return (uint8_t)(((b / 10) << 4) | (b % 10)); }
+
+// 一次读 0x00~0x06 共 7 字节(秒/分/时/星期/日期/月/年),地址自动递增。
+inline bool readTime(int& Y, int& Mo, int& D, int& h, int& mi, int& s) {
+  Wire.beginTransmission(kAddr);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) { ++rdErr; return false; }
+  if (Wire.requestFrom((int)kAddr, 7) != 7) { ++rdErr; return false; }
+  uint8_t d[7];
+  for (int i = 0; i < 7; ++i) d[i] = (uint8_t)Wire.read();
+
+  s  = bcd2bin(d[0] & 0x7F);                 // bit7 是保留位
+  mi = bcd2bin(d[1]);
+  // 时:bit6 = 12/24 小时制,bit5 = AM/PM。模块出厂是 24 小时制,但别人
+  // 用 Arduino 的 RTClib 设过时间就可能变成 12 小时制 —— 两种都认。
+  if (d[2] & 0x40) {
+    h = bcd2bin(d[2] & 0x1F);
+    if (d[2] & 0x20) h = (h % 12) + 12;      // PM
+    else             h = h % 12;             // AM:12 -> 0
+  } else {
+    h = bcd2bin(d[2] & 0x3F);
+  }
+  D  = bcd2bin(d[4]);
+  Mo = bcd2bin(d[5] & 0x1F);
+  Y  = 2000 + bcd2bin(d[6]) + ((d[5] & 0x80) ? 100 : 0);   // bit7 = 世纪
+
+  // 读出来的东西先做范围自检 —— 掉电途中读到的可能是 0x00 或 0xFF 的垃圾。
+  if (Mo < 1 || Mo > 12 || D < 1 || D > 31 || h > 23 || mi > 59 || s > 59) {
+    ++rdErr; return false;
+  }
+  return true;
+}
+
+// 写时间。withSec = false 时**跳过秒寄存器**,从 0x01 起写 —— 这是整套
+// 相位差观测能不能用的关键(见文件头那三条线里的第③条)。
+inline bool writeTime(int Y, int Mo, int D, int h, int mi, int s, bool withSec) {
+  Wire.beginTransmission(kAddr);
+  Wire.write((uint8_t)(withSec ? 0x00 : 0x01));
+  if (withSec) Wire.write(bin2bcd((uint8_t)s));
+  Wire.write(bin2bcd((uint8_t)mi));
+  Wire.write(bin2bcd((uint8_t)h));      // bit6=0 即 24 小时制
+  Wire.write((uint8_t)1);               // 星期:本项目不用,写 1
+  Wire.write(bin2bcd((uint8_t)D));
+  uint8_t mo = bin2bcd((uint8_t)Mo);
+  if (Y >= 2100) mo |= 0x80;            // 世纪位
+  Wire.write(mo);
+  Wire.write(bin2bcd((uint8_t)(Y % 100)));
+  if (Wire.endTransmission() != 0) { ++rdErr; return false; }
+  ++wrCnt;
+  if (withSec) ++wrHard;
+  return true;
+}
+
+// 温度:0x11 高 8 位(有符号整数)+ 0x12 高 2 位(0.25℃ 步进)。
+// ★ 芯片自己每 64 s 才更新一次这个寄存器 —— 读太快没有新值,所以限速。
+inline bool readTemp(float& t) {
+  Wire.beginTransmission(kAddr);
+  Wire.write((uint8_t)0x11);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((int)kAddr, 2) != 2) return false;
+  const int8_t  hi = (int8_t)(uint8_t)Wire.read();
+  const uint8_t lo = (uint8_t)Wire.read();
+  t = (float)hi + (float)(lo >> 6) * 0.25f;
+  return true;
+}
+
+inline void begin() {
+  Wire.beginTransmission(kAddr);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[bench] ds3231 not found on 0x68 -- 时间源只剩 GNSS(断了就断流)");
+    present = false;
+    return;
+  }
+  present = true;
+
+  // SQW 1 Hz -> GPIO15 上升沿中断(与 PPS 分开两个脚,见文件头第①条)
+  pinMode(PIN_DS3231_SQW, INPUT_PULLDOWN);   // 拔线后悬空不被噪声触发(同 PPS 的处理)
+  attachInterrupt(digitalPinToInterrupt(PIN_DS3231_SQW), onSqw, RISING);
+
+  // 状态寄存器 0x0F:bit7 = OSF(振荡器停过)。置位 = 电池掉过/首次上电,
+  // 里面的时间不可信 —— 只能等 GNSS 来校。清掉标志,时间值仍就不可信。
+  Wire.beginTransmission(kAddr);
+  Wire.write((uint8_t)0x0F);
+  if (Wire.endTransmission() == 0 && Wire.requestFrom((int)kAddr, 1) == 1) {
+    const uint8_t st = (uint8_t)Wire.read();
+    osf = (st & 0x80) != 0;
+    if (osf) {
+      Wire.beginTransmission(kAddr);
+      Wire.write((uint8_t)0x0F); Wire.write((uint8_t)0x00);
+      Wire.endTransmission();
+    }
+  }
+
+  int Y, Mo, D, h, mi, s;
+  const bool got = readTime(Y, Mo, D, h, mi, s);
+  tempOk = readTemp(tempC);
+  // 年份闸:出厂模块是 2000-01-01。2000~2023 一律当"没设过"。
+  valid = got && !osf && Y >= 2024;
+  if (got) {
+    Serial.printf("[bench] ds3231 @0x68  %04d-%02d-%02d %02d:%02d:%02d UTC  %.2fC  osf %d  %s\n",
+                  Y, Mo, D, h, mi, s, tempOk ? tempC : -99.0f, osf ? 1 : 0,
+                  valid ? "time ok" : "time UNTRUSTED (等 GNSS 校)");
+  } else {
+    Serial.println("[bench] ds3231 @0x68  present but read failed");
+  }
+}
+
+inline void poll() {
+  if (!present) return;
+  const uint32_t now = millis();
+  if (now - lastMs < 1000u) return;
+  lastMs = now;
+
+  int Y, Mo, D, h, mi, s;
+  if (readTime(Y, Mo, D, h, mi, s)) {
+    failCnt = 0;
+    // 时间从"不可信"变可信的唯一途径:有人给它写过一个像样的时间
+    // (GNSS 校准会写,用户在别的工具里设过也算)。年份闸挡住出厂默认。
+    if (!valid && Y >= 2024) valid = true;
+  } else {
+    if (++failCnt >= 3) valid = false;   // 连续 3 秒读不通 -> 当作不可用
+  }
+
+  // 温度:芯片 64 s 才更新一次,10 s 读一次已经很勤快了
+  if (now - lastTempMs >= 10000u) {
+    lastTempMs = now;
+    float t;
+    if (readTemp(t)) { tempC = t; tempOk = true; }
+  }
+}
+
+}  // namespace ds3231
+
+// ----------------------------------------------------------------------------
+//  clk —— 全项目**唯一**的"现在几点"
+//  以前这件事散在 nmea::st 里(ZDA 原文),现在收口到这里:
+//  谁要时间都问 clk,不再各自去读报文。仲裁规则一句话:
+//    GNSS UTC 新鲜 -> GNSS 主;否则 DS3231 主(标 HOLDOVER);都没有 -> 不可信。
+// ----------------------------------------------------------------------------
+namespace clk {
+
+enum Src : uint8_t { SRC_NONE = 0, SRC_GNSS = 1, SRC_RTC = 2 };
+
+static const uint32_t kSyncMs = 60000u;   // 多久把 GNSS 时间写回 DS3231 一次
+
+static Src      src        = SRC_NONE;
+static uint32_t anchorMs   = 0;      // 锚点:millis() 那一瞬
+static uint32_t anchorSod  = 0;      // 锚点对应的 UTC 当天秒
+static int      aY = 2000, aMo = 1, aD = 1;   // 锚点日期
+static uint32_t lastSyncMs  = 0;
+static bool     syncPending = true;  // 刚接上 GNSS 时立刻校一次
+static uint32_t sncOk      = 0;      // 成功写入 DS3231 的次数
+static uint32_t phaseResetMs = 0;    // 最近一次硬写打断 SQW 相位的时刻
+
+// GNSS 时间"新鲜"的判据。★ v1.14.0 定稿:必须**定位也有效**才算。
+//   只判 ZDA 新不新鲜是不够的 —— 模块失锁后很可能继续吐 ZDA(带最后已知时间),
+//   那样我们会一直以为"时间是 GNSS 给的",DS3231 永远轮不上。
+//   两个超时都用现成的 TH_STALE_MS(不另起一个数 —— 一个量只许一个真源)。
+//   ★ 副作用(是故意的):冷启动还没定位时 fixValid=false -> 时间源先用 RTC,
+//     屏上时间行会挂 " RTC" 角标。这正是事实:那段时间确实是钟在撑。
+inline bool gnssFresh(uint32_t now) {
+  return nmea::st.utcValid && nmea::st.utcMs != 0 && (now - nmea::st.utcMs) < TH_STALE_MS
+      && nmea::st.fixValid && nmea::st.fixMs != 0
+      && (now - nmea::st.fixMs) <= TH_STALE_MS;
+}
+
+// 把 GNSS 的 UTC 写进 DS3231。返回值 = 这次是不是"硬写"(连秒一起写)。
+static bool syncRtc() {
+  int Y, Mo, D, h, mi, s;
+  if (!ds3231::readTime(Y, Mo, D, h, mi, s)) return false;
+  const bool secOk = (s == nmea::st.uS);      // 秒已经对 -> 只改分/时/日期
+  const bool ok = ds3231::writeTime(nmea::st.uY, nmea::st.uMo, nmea::st.uD,
+                                    nmea::st.uH, nmea::st.uMi, nmea::st.uS, !secOk);
+  if (!ok) return false;
+  if (!secOk) phaseResetMs = millis();        // 相位基线被打断,记一笔
+  ds3231::valid = true;
+  ++sncOk;
+  return !secOk;
+}
+
+// 串口 'u sync' 用:不等 60 s 的节拍,立刻用 GNSS 校一次钟。
+// 返回 false = 条件不满足(GNSS 时间不新鲜 / DS3231 不在),没动任何东西。
+inline bool forceSync() {
+  if (!ds3231::present || !gnssFresh(millis())) return false;
+  syncRtc();
+  lastSyncMs  = millis();
+  syncPending = false;
+  return true;
+}
+
+inline void poll() {
+  const uint32_t now = millis();
+
+  // ---------------- GNSS 主 ----------------
+  if (gnssFresh(now)) {
+    const bool first = (src != SRC_GNSS);
+    src       = SRC_GNSS;
+    anchorMs  = nmea::st.utcMs;     // ★ 用报文到达时刻,不用 PPS(见文件头第②条)
+    anchorSod = (uint32_t)nmea::st.uH * 3600u + (uint32_t)nmea::st.uMi * 60u
+                + (uint32_t)nmea::st.uS;
+    aY = nmea::st.uY; aMo = nmea::st.uMo; aD = nmea::st.uD;
+
+    if (first) {
+      Serial.println("[bench] clk: 时间源 = GNSS(ZDA)");
+      syncPending = true;            // 刚接上:立刻把钟校一遍,不等下一个 60 s
+    }
+    if (ds3231::present && (syncPending || now - lastSyncMs >= kSyncMs)) {
+      syncRtc();
+      lastSyncMs  = now;
+      syncPending = false;
+    }
+    return;
+  }
+
+  // ---------------- DS3231 顶上(HOLDOVER) ----------------
+  if (ds3231::present && ds3231::valid) {
+    int Y, Mo, D, h, mi, s;
+    if (!ds3231::readTime(Y, Mo, D, h, mi, s)) return;
+    const uint32_t sod = (uint32_t)h * 3600u + (uint32_t)mi * 60u + (uint32_t)s;
+
+    if (src != SRC_RTC) {
+      src = SRC_RTC;
+      anchorMs = millis(); anchorSod = sod;
+      aY = Y; aMo = Mo; aD = D;
+      Serial.printf("[bench] clk: GNSS 时间中断 -> 切 DS3231(HOLDOVER @ %02d:%02d:%02d UTC)\n",
+                    h, mi, s);
+      return;
+    }
+    // 已经在 holdover:每拍(1 s)拿 DS3231 对表,只有差到 >=2 s 才重锚。
+    // 为什么不是每拍都重锚:DS3231 读回的是整秒,而 millis 插值已经走了
+    // 那个秒的大半 —— 每拍重锚会让显示时间**回跳**,看着像钟在抖。
+    const uint32_t walk = anchorSod + (millis() - anchorMs) / 1000u;
+    const int32_t  diff = (int32_t)sod - (int32_t)(walk % 86400u);
+    if (diff >= 2 || diff <= -2) {
+      anchorMs = millis(); anchorSod = sod;
+      aY = Y; aMo = Mo; aD = D;
+      Serial.printf("[bench] clk: holdover 重锚 %+lds\n", (long)diff);
+    }
+    return;
+  }
+
+  // ---------------- 两个都没有 ----------------
+  if (src != SRC_NONE) {
+    src = SRC_NONE;
+    Serial.println("[bench] clk: GNSS 与 DS3231 都不可用 —— 时间不可信");
+  }
+}
+
+// 取当前 UTC(会自己走,不依赖报文)。返回 false = 不可信。
+inline bool utc(int& Y, int& Mo, int& D, int& h, int& mi, int& s) {
+  if (src == SRC_NONE) return false;
+  uint32_t sod = anchorSod + (millis() - anchorMs) / 1000u;
+  Y = aY; Mo = aMo; D = aD;
+  while (sod >= 86400u) {                       // 跨 UTC 零点自己进位
+    sod -= 86400u;
+    if (++D > daysInMonth(Y, Mo)) { D = 1; if (++Mo > 12) { Mo = 1; ++Y; } }
+  }
+  h  = (int)(sod / 3600u);
+  mi = (int)((sod / 60u) % 60u);
+  s  = (int)(sod % 60u);
+  return true;
+}
+
+inline uint32_t sod() {                          // 当天秒(UTC);不可信时返回 0
+  int Y, Mo, D, h, mi, s;
+  if (!utc(Y, Mo, D, h, mi, s)) return 0;
+  return (uint32_t)h * 3600u + (uint32_t)mi * 60u + (uint32_t)s;
+}
+
+inline void date(char* out, size_t n) {          // "MM-DD"(UTC)
+  int Y, Mo, D, h, mi, s;
+  if (!utc(Y, Mo, D, h, mi, s)) { snprintf(out, n, "??-??"); return; }
+  snprintf(out, n, "%02d-%02d", Mo, D);
+}
+
+inline bool isHoldover() { return src == SRC_RTC; }
+
+// 时间源的单字符标记(G = GNSS / R = holdover 用 RTC / - = 不可信)。给 obs 流用。
+inline const char* srcTag() {
+  return (src == SRC_GNSS) ? "G" : ((src == SRC_RTC) ? "R" : "-");
+}
+
+// ★ v1.14.1:当前 UTC 的 Unix 秒(1970-01-01 起);时间不可信返回 0。
+//   为什么 obs 里非要它:obs 第一列是 millis(),**重启就归零**。8 小时无人值守
+//   一旦半夜复位,前一段和后一段在毫秒轴上完全无法拼;而事件的 t0 是"当天秒",
+//   跨 UTC 零点还要另算。epoch 一列把"对墙钟"和"拼接重启"两件事一起解决。
+inline uint32_t epoch() {
+  int Y, Mo, D, h, mi, s;
+  if (!utc(Y, Mo, D, h, mi, s)) return 0;
+  uint32_t days = 0;
+  for (int y = 1970; y < Y; ++y) days += isLeapYear(y) ? 366u : 365u;
+  static const uint8_t dm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  for (int m = 1; m < Mo; ++m)
+    days += (uint32_t)dm[m - 1] + ((m == 2 && isLeapYear(Y)) ? 1u : 0u);
+  days += (uint32_t)(D - 1);
+  return days * 86400u + (uint32_t)h * 3600u + (uint32_t)mi * 60u + (uint32_t)s;
+}
+
+// SQW 与 PPS 的相位差(us),归一化到 ±500 ms:
+//   >0 = SQW 落后 PPS;0 = 还没得比(任一边 >2 s 没沿)。
+// ★ 绝对值本身没有意义(取决于上次校准时怎么对齐);有信息的是**它的斜率**,
+//   斜率 = 两把表的频率差。这条要在观测/判读时始终记住。
+inline int32_t phaseUs() {
+  const uint32_t a = ds3231::sqwEdgeUs;
+  const uint32_t b = pps::lastEdgeUsRead();
+  if (a == 0 || b == 0) return 0;
+  const uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - a) > 2000000u) return 0;   // SQW 停了
+  if ((uint32_t)(nowUs - b) > 2000000u) return 0;   // PPS 停了(失锁时属正常)
+  int32_t d = (int32_t)(a - b);                     // 无符号减法天然处理回绕
+  if (d >  500000) d -= 1000000;
+  if (d < -500000) d += 1000000;
+  return d;
+}
+
+// 现场排查用(串口 'u')。一行把"时间从哪来、钟准不准、两边差多少"全说清。
+inline void report() {
+  int Y, Mo, D, h, mi, s;
+  const bool ok = utc(Y, Mo, D, h, mi, s);
+  const char* nm = (src == SRC_GNSS) ? "GNSS" : ((src == SRC_RTC) ? "RTC(holdover)" : "none");
+  if (ok) {
+    Serial.printf("[bench] clk: src %s | utc %04d-%02d-%02d %02d:%02d:%02d\n",
+                  nm, Y, Mo, D, h, mi, s);
+  } else {
+    Serial.printf("[bench] clk: src %s | utc ---- (不可信)\n", nm);
+  }
+  const int32_t ph = phaseUs();
+  Serial.printf("[bench] rtc: present %d valid %d osf %d | sqw %lu | wr %lu (hard %lu) "
+                "sync %lu | %.2fC | rdErr %lu\n",
+                ds3231::present ? 1 : 0, ds3231::valid ? 1 : 0, ds3231::osf ? 1 : 0,
+                (unsigned long)ds3231::sqwCount,
+                (unsigned long)ds3231::wrCnt, (unsigned long)ds3231::wrHard,
+                (unsigned long)sncOk,
+                ds3231::tempOk ? ds3231::tempC : -99.0f,
+                (unsigned long)ds3231::rdErr);
+  if (ph != 0) {
+    Serial.printf("[bench] rtc: phase %+.1f ms (SQW - PPS;正值 = SQW 落后;"
+                  "★ 绝对值无意义,看它的斜率)\n", (double)ph / 1000.0);
+  } else {
+    Serial.println("[bench] rtc: phase --- (任一边 >2s 没脉冲:PPS 失锁或 SQW 未接)");
+  }
+  // ★ v1.14.1:把"为什么没切 holdover"的四道门控摊开 —— 现场排查专用。
+  //   用户 2026-10-27 反馈"盖了手掌也没什么反应",最大嫌疑就是这里的某一项还成立:
+  //   手掌只挡一部分天区时,模块往往仍有 4~6 颗星在解,**fix 一直有效** ⇒
+  //   时间确实还是 GNSS 给的 ⇒ 按设计就不该切 RTC。"没反应"不是坏,是没满足条件。
+  //   要真看到 R角标,得让 fix 也断(整只手裹严 / 拔天线)。
+  const uint32_t nowMs = millis();
+  const long utcAge = nmea::st.utcMs ? (long)(nowMs - nmea::st.utcMs) : -1L;
+  const long fixAge = nmea::st.fixMs ? (long)(nowMs - nmea::st.fixMs) : -1L;
+  Serial.printf("[bench] clk gate: utc有效 %d 年龄 %ldms | fix有效 %d 年龄 %ldms | "
+                "门槛 %lums | ⇒ gnssFresh %d\n",
+                nmea::st.utcValid ? 1 : 0, utcAge,
+                nmea::st.fixValid ? 1 : 0, fixAge,
+                (unsigned long)TH_STALE_MS, gnssFresh(nowMs) ? 1 : 0);
+  if (!gnssFresh(nowMs) && src != SRC_RTC)
+    Serial.println("[bench] clk gate: 判据说 GNSS 不新鲜了,但没切 RTC —— 查上面 present/valid");
+}
+
+}  // namespace clk
+
+// ============================================================================
+//  第 3.6 段:pdomon —— DS3231 频率判据(SQW-PPS 相位差的短窗斜率)  ★ v1.14.4 新增
+//
+//  由来(2026-10-28,首夜 16.5h 数据分析):pdo 从 v1.14.0 起一直只是"记录 + 人工看",
+//  没有任何自动判据。串口 'u' 的注释写着"绝对值无意义,看斜率",但"看斜率"这四个字
+//  从来没人替固件做 —— 每次都得人把 CSV 拉回电脑算。这一版把它做成板上判据。
+//
+//  ★★ 为什么不能用 pdo 的绝对值当判据(这是本段最要紧的一条):
+//    pdo 取决于**上次校准那一刻**两把表对齐到哪儿,换个开机时刻就换个值。
+//    首夜实测 pdo 在 296.9 ~ 303.5 ms 之间,跨度 6.6 ms —— 而这个数字里**根本没有
+//    频率信息**,只有"当初对齐偏了多少"。拿它设阈值,第一天就会误报。
+//
+//  ★★ 为什么单窗斜率也不能直接用(首夜量化过,信噪比 < 1):
+//    60 min 窗、温度未修正时,斜率 std = 0.786 ms/h;而这台 DS3231 的真实频率偏差
+//    只有 +0.42 ms/h(≈ -0.117 ppm)。**噪声是信号的 1.9 倍** —— 单窗斜率读不出东西。
+//    最坏情况:首夜 03:31 那个窗环境温度变化率 +27.0 ℃/h,乘温度系数 -0.075 ms/℃
+//    ⇒ 温度一项就贡献 -2.0 ms/h,把 0.42 完全淹没。
+//    ⇒ 所以判据必须两件事一起做:**温度修正**(把温度贡献减掉)+ **温度同步闸**
+//      (温度变化太快时,修正本身不成立,该窗直接作废而不是硬算)。
+//
+//  ★ 参数全部来自 2026-10-27 夜首夜数据(docs/实验数据/2026-10-28/),不是拍脑袋:
+//    · kTempCoef = -0.075 ms/℃:12,053 行多元最小二乘 pdo = a + b·t + c·T 的 c。
+//      同一拟合的 b = +0.4209 ms/h ⇒ **-0.117 ppm**,与只取夜间恒温段(+0.396 ms/h
+//      ⇒ -0.110 ppm)交叉一致 —— 两条独立算法同符号同量级,这个系数可以信。
+//      (注:温度与时间在昼夜尺度上高度共线,c 只能算"昼夜平均斜率",不是精密标定值。
+//       真要做精密温度系数,得进恒温箱做阶梯升温 —— 那是另一件事,别拿这条当依据。)
+//    · kSlopeTol = 1.0 ms/h:温度修正后 60 min 窗 std = 0.339 ⇒ 1.0 ≈ 3σ。
+//    · kWinSlots = 60(60 min):30 min 窗修正后 std 仍 0.89(几乎压不动,因为窗内温度
+//      可能整段剧烈变化,线性修正不成立);2 h 窗 std 降到 0.230 但响应太慢。
+//      60 min 是"压得下噪声 + 出事一小时内能看见"的折中。
+//    · kDTMaxCph = 5.0 ℃/h:首夜 16 个窗里,偏离 ±1.0 的全是温度剧变窗
+//      (02:31 dT=+9.7、03:31 dT=+27.0);加上这道闸后**零虚警**。
+//      为什么是"作废"而不是"多修一点":SHT30 量的是**环境**温度,DS3231 的芯片温度
+//      滞后于它,温度在快速变化时两者不是同一个量 —— 修正公式的前提已经不成立了,
+//      这时候硬算出来的斜率是**假的**,不是"差一点的真值"。
+//
+//  ★★ 出口只走串口诊断('u'),**不进状态词、不进事件、不动 obs 列**:
+//    · 状态词表(phrase::PH_*)是硬冻结的 —— PhraseId 的数值存进 NVS 的 EventRec.type,
+//      插中间会让全部历史事件类型错位;追加也要同步 C3 文案表与协议。频率判据够不上
+//      这个代价(它说的是"这颗 RTC 走得准不准",与"这次定位可不可信"是两件事,
+//      混进同一个状态词会让用户以为定位出了问题)。
+//    · obs 已定 18 列,再加列要同步导出脚本 + 操作卡 + 分析文档 —— 等判据在实机上
+//      跑够几夜、确认真有用再说,现在加列是给未验证的东西上账。
+//   ⇒ 本段对判据算法 / 状态词 / 协议 / NVS 布局 / 界面 / C3:**全部零改动**。
+//
+//  ★ 基线(base)不存 NVS:重启后重新学 1 小时。理由:基线是"这台机器当前的固有频率
+//    偏差",它本来就会随温度/老化缓慢变化,存下来反而会把"上次那个"当成"现在这个"。
+//    代价是每次重启头 1 小时无判据 —— 这一点必须明说,不能装作一直在判。
+// ============================================================================
+namespace pdomon {
+
+constexpr uint32_t kSlotMs     = 60000;   // 1 min 一个采样点
+constexpr uint8_t  kSlots      = 64;      // 环形缓冲 64 点(判据用最近 60 点)
+constexpr uint8_t  kWinSlots   = 60;      // 判据窗 = 60 点 = 60 min
+constexpr float    kTempCoef   = -0.075f; // ms/℃  温度修正系数(首夜多元拟合)
+constexpr float    kDTMaxCph   = 5.0f;    // ℃/h   窗内温度变化率上限,超过该窗作废
+constexpr float    kSlopeTol   = 1.0f;    // ms/h  ≈3σ(修正后 std 0.339)
+constexpr float    kBaseAlpha  = 0.003f;  // 基线跟踪 α(每次窗评估一次)
+                                          // ★★ v1.14.4 初版写的是 0.17,想表达 "τ≈6 窗=6h"
+                                          //    —— 但**窗是每 1 min 滚动评估一次的**,不是每 1 h 一次
+                                          //    ⇒ 实际 τ 只有 6 min,基线跟着异常一起跑,
+                                          //    注入 +1.5 ms/h(远超 1.0 阈值)也报不出来(离线回放实测)。
+                                          //    改成 0.003 ⇒ τ = 1/0.003 ≈ 333 次评估 ≈ 5.5 h,与设计意图一致。
+                                          //    ★ 这条错误的性质:参数写的是"次数",注释想的是"小时" ——
+                                          //      两者差 60 倍。凡是"每次评估动一点"的滤波器,**单位必须写明是次还是秒**。
+constexpr float    kBaseGate   = 0.5f;    // 偏离超过 kSlopeTol×它就不更新基线
+constexpr uint8_t  kConfirm    = 2;       // 连续 2 个合格窗同向超限才置异常
+constexpr float    kClearFrac  = 0.7f;    // 回到 kSlopeTol×它以内才算"恢复"
+
+// 环形缓冲。存 0.1 ms / 0.1 ℃ 的定点,一格 4 B,64 格 = 256 B。
+// 用定点不用 float:一个格子省 4 B,而且落盘/打印时不用再乘除。
+static int16_t  sPdo10[kSlots];   // pdo × 10(0.1 ms)
+static int16_t  sT10[kSlots];     // 温度 × 10(0.1 ℃)
+// ★★ v1.14.4 修正:必须存**真实时间戳**,不能假设"相邻点差 60 s"。
+//    起因(2026-10-28 20:5x 实机):烧上去后 GNSS 短暂失锁,phaseUs() 返回 0 ⇒ 采不到点
+//    ⇒ 恢复后缓冲里第 N 点与第 N+1 点的真实间隔是**几十分钟**,但初版按 i×60 s 算时间轴
+//    ⇒ 回归斜率直接算错,而屏幕上什么都不显示(判据只会"沉默",不会报错)。
+//    ★ 这类 bug 离线回放抓不到:首夜数据全程有 fix,采样从未间断 —— 数据覆盖不到的场景
+//      只能靠"读代码时问一句这个假设成立吗"。
+static uint32_t sMs[kSlots];      // millis() 快照
+static uint8_t  sHead   = 0;      // 下一个写入位置
+static uint8_t  sFilled = 0;      // 已有多少点(上限 kSlots)
+static uint32_t sLastMs = 0;
+
+static bool     sBaseInit = false;
+static float    sBase     = 0.0f; // 基线斜率(ms/h)
+static uint8_t  sOverStreak = 0;  // 连续超限窗数
+static uint8_t  sOkStreak   = 0;  // 连续合格窗数
+static bool     sAlarm      = false;
+
+// 诊断快照(给 'u' 用,不影响判据)
+static float    sLastSlope = 0.0f;
+static float    sLastDT    = 0.0f;
+static float    sLastWinH  = 0.0f;   // 本窗真实跨度(小时) —— 采样有间断时它会 > 1.0
+static uint8_t  sWinOk     = 0;   // 累计合格窗数
+static uint8_t  sWinSkip   = 0;   // 累计因温度剧变作废的窗数
+static bool     sHaveSlope = false;
+
+// 一次窗评估:返回 true = 本窗合格(已参与判据)
+static bool evalWindow() {
+  const uint8_t n = kWinSlots;
+  // 按时间顺序取最近 n 个点(环形缓冲里最老的那个是 sHead 指向的位置)
+  const uint8_t start = (uint8_t)((sHead + kSlots - n) % kSlots);
+  const uint8_t last  = (uint8_t)((start + n - 1) % kSlots);
+
+  // ★ v1.14.4:时间轴一律用**真实时间戳**,不再假设 i×60 s(理由见 sMs 的注释)
+  const float dtMs = (float)(sMs[last] - sMs[start]);        // 本窗真实跨度(ms)
+  if (dtMs < (float)(kSlotMs * (kWinSlots - 4))) return false;   // 跨度明显不足 ⇒ 不做判决
+
+  // ① 温度同步闸:先看窗内温度变化率,太快就整窗作废
+  const float dT   = (float)(sT10[last] - sT10[start]) / 10.0f;
+  const float dtH  = dtMs / 3600000.0f;                      // 小时
+  const float dTph = (dtH > 0.0f) ? (dT / dtH) : 0.0f;
+  sLastDT = dTph;
+  if (fabsf(dTph) > kDTMaxCph) { ++sWinSkip; return false; }
+
+  // ② 温度修正 + 线性回归  y_i = pdo_i - kTempCoef·(T_i - T_0)
+  //    减 T_0 是为了让截距有意义(不离 0 太远,浮点更稳);斜率不受影响。
+  const float c0 = (float)sT10[start] / 10.0f;
+  float st = 0.0f, sy = 0.0f, stt = 0.0f, sty = 0.0f;
+  for (uint8_t i = 0; i < n; ++i) {
+    const uint8_t k = (uint8_t)((start + i) % kSlots);
+    const float t = (float)(sMs[k] - sMs[start]) / 3600000.0f;            // 小时(真实)
+    const float y = (float)sPdo10[k] / 10.0f - kTempCoef * ((float)sT10[k] / 10.0f - c0);
+    st += t; sy += y; stt += t * t; sty += t * y;
+  }
+  const float den = (float)n * stt - st * st;
+  if (den <= 0.0f) return false;
+  const float slope = ((float)n * sty - st * sy) / den;              // ms/h
+  sLastSlope = slope;
+  sLastWinH  = dtH;
+  sHaveSlope = true;
+  ++sWinOk;
+
+  // ③ 基线:首个合格窗直接取它,之后慢跟;**偏离大时不跟**(防止异常把基线带跑,
+  //    带跑之后判据就永久失明了 —— 这是本项目硬教训 #12 的同一类坑)
+  if (!sBaseInit) { sBase = slope; sBaseInit = true; }
+  else if (fabsf(slope - sBase) < kSlopeTol * kBaseGate)
+    sBase += kBaseAlpha * (slope - sBase);
+
+  // ④ 判决:连续 kConfirm 个窗同向超限才置异常;回到 70% 以内连续 kConfirm 才清
+  const float dev = slope - sBase;
+  if (fabsf(dev) > kSlopeTol) { ++sOverStreak; sOkStreak = 0; }
+  else                         { sOverStreak = 0; }
+  if (sOverStreak >= kConfirm) sAlarm = true;
+  if (sAlarm) {
+    if (fabsf(dev) < kSlopeTol * kClearFrac) { ++sOkStreak; if (sOkStreak >= kConfirm) { sAlarm = false; sOverStreak = 0; } }
+    else sOkStreak = 0;
+  }
+  return true;
+}
+
+inline void tick() {
+  const uint32_t now = millis();
+
+  // ★ v1.14.4:采样中断检测。GNSS 失锁 / 温度读不到时本函数会跳过不写点,
+  //   于是相邻两点的真实间隔可能是几十分钟。**一个窗里混进不连续的数据,
+  //   回归出来的斜率就不是"这一小时的漂移速率"了**。所以中断太久就整窗重攒。
+  //   阈值取 3×kSlotMs:容忍偶尔丢一两拍(调度抖动),超过就是真断过。
+  if (sLastMs != 0 && (now - sLastMs) > (kSlotMs * 3u)) {
+    sFilled = 0; sHead = 0;                    // 缓冲作废重攒(基线 sBase **不清** ——
+                                               //   它是长期量,不因一次失锁就重新学)
+    sLastMs = 0;
+    return;
+  }
+
+  if (sLastMs != 0 && (now - sLastMs) < kSlotMs) return;
+
+  // ★ 采不到就**不写**:环里只放真值。
+  //   若把"相位不可比"写成 0,一次 PPS 短失锁就会在曲线里砸出一个假台阶,
+  //   而 60 min 窗的斜率会被这一个点拖歪 —— 这种污染比"少一个点"危险得多。
+  const int32_t ph = clk::phaseUs();
+  if (ph == 0) return;                                  // 任一边没脉冲
+  if (!sht::haveVal || sht::stale) return;              // 温度不可信就不采(温度修正要有真温度)
+
+  sLastMs = now;
+  sPdo10[sHead] = (int16_t)lroundf((float)ph / 100.0f); // us -> 0.1 ms
+  sT10[sHead]   = (int16_t)lroundf(sht::tempC * 10.0f);
+  sMs[sHead]    = now;                                  // ★ 真实时间戳
+  sHead = (uint8_t)((sHead + 1) % kSlots);
+  if (sFilled < kSlots) ++sFilled;
+
+  if (sFilled >= kWinSlots) evalWindow();
+}
+
+// 串口 'u' 用。一行把"够不够点、斜率多少、基线在哪、判没判"全说清。
+inline void report() {
+  if (sFilled < kWinSlots) {
+    Serial.printf("[bench] pdo: 采样中 %u/%u 点(还差 %u min 才能出第一个窗)\n",
+                  (unsigned)sFilled, (unsigned)kWinSlots,
+                  (unsigned)(kWinSlots - sFilled));
+    // ★ 这句是给"看着不动"准备的:点数不涨只有两个原因,都在这里说得清。
+    if (clk::phaseUs() == 0)
+      Serial.println("[bench] pdo: ↑点数为 0 是因为 PPS/SQW 没有脉冲 —— "
+                     "本判据需要 GNSS **有 fix**(PPS 由它给);失锁期间它不采点、也判不了");
+    else if (!sht::haveVal || sht::stale)
+      Serial.println("[bench] pdo: ↑点数为 0 是因为温度不可信(SHT30 没读到/陈旧)");
+    return;
+  }
+  if (!sHaveSlope) {
+    Serial.println("[bench] pdo: 窗还不可用(采样有间断,跨度不足 —— 已丢弃重攒)");
+    return;
+  }
+  Serial.printf("[bench] pdo: 斜率 %+.3f 基线 %+.3f 偏差 %+.3f ms/h | dT %+.1f C/h | "
+                "窗 %.2fh 合格 %u 作废(温度剧变) %u | 阈值 ±%.1f 连续 %u 窗 | 状态 %s\n",
+                (double)sLastSlope, (double)sBase, (double)(sLastSlope - sBase),
+                (double)sLastDT, (double)sLastWinH, (unsigned)sWinOk, (unsigned)sWinSkip,
+                (double)kSlopeTol, (unsigned)kConfirm,
+                sAlarm ? "频率异常" : "OK");
+  // ★ 这句必须留着:判据的天花板写清楚,别让后来的人指望它做它做不到的事。
+  Serial.println("[bench] pdo: 它判的是**本机 RTC 相对 GNSS 的频率稳定性**(小时级),"
+                 "不是绝对准确度;重启后头 1 h 无判据(基线重新学)");
+}
+
+inline bool alarm() { return sAlarm; }
+
+}  // namespace pdomon
+
+// ============================================================================
+//  第 3.7 段:rec —— 观测流落盘(LittleFS)  ★ v1.14.1 新增
+//
+//  由来(2026-10-27 用户):"我今晚打算把台架放到阳台去做 8 小时试验…这次是单把
+//  台架拿去,不带电脑"。而 v1.13.0 的 obs 流只往 Serial 打(注释原话 "RAM only"),
+//  没人接串口 = 一行都不留。这版把观测行同时写进 flash 文件,让数据能过夜。
+//
+//  三条设计决定(都写在这里,免得下次有人"顺手优化"掉):
+//   ① 落 **spiffs 分区**(partitions.csv: 0x720000 起 8.875 MB,建表起从未写过)。
+//      8 小时 × 5 s 一行 ≈ 5,760 行 ≈ 0.6 MB —— 占 7%,够跑 5 天多。
+//   ② **每 60 s 才 flush 一次**,不是每行。flash 有擦写寿命,5 s 一刷 = 一晚 5,760 次;
+//      60 s 一刷,掉电最多丢最后一分钟 —— 对长挂观测完全够,不值得拿磨损换。
+//   ③ 开机写一行 `#BOOT` 头(版本 + 复位原因 + UTC)。同一文件里会叠多段会话,
+//      没有头就分不清"这一坨是哪次开机写的"。
+//   ④ 落盘与串口打印是**两条独立通路**:写文件失败不影响串口,反之亦然 ——
+//      一条坏了另一条还能取证(不做"二选一")。
+// ============================================================================
+namespace rec {
+
+constexpr const char* kPath    = "/obs.csv";
+constexpr uint32_t    kFlushMs = 60000u;
+constexpr const char* kNvsName = "gnsrec";       // 只存一个 auto 标志,与 gnsevt/judge 分开
+
+static bool        ready  = false;
+static File        f;
+static uint32_t    nLines = 0;                   // 本次开机写入行数
+static uint32_t    nErr   = 0;                   // 写失败次数(健康巡检看这个)
+static uint32_t    lastFlushMs = 0;
+static Preferences prefs;
+
+inline bool begin() {
+  if (ready) return true;
+  // 先**不格式化**挂载(保住已有数据);挂不上才格式化一次 ——
+  //   LittleFS.begin(true) 会擦整个分区,是破坏性操作,不能当默认路径。
+  if (!LittleFS.begin(false)) {
+    Serial.println("[rec] LittleFS 挂载失败 -> 首次格式化 spiffs 分区(只应发生一次)");
+    if (!LittleFS.begin(true)) {
+      Serial.println("[rec] 格式化也失败 —— 落盘不可用(本晚数据只能走串口)");
+      return false;
+    }
+  }
+  f = LittleFS.open(kPath, FILE_APPEND);
+  if (!f) {
+    Serial.printf("[rec] 打不开 %s —— 落盘不可用\n", kPath);
+    return false;
+  }
+  ready = true;
+  Serial.printf("[rec] 落盘就绪 %s | 已有 %u B | 分区 %u/%u B 已用\n",
+                kPath, (unsigned)f.size(),
+                (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+  return true;
+}
+
+// 开机头。rst 传 resetReasonText() 的原文,便于事后把"半夜重启"和"人为烧录"分开。
+inline void bootHeader(const char* ver, const char* rst) {
+  if (!begin()) return;
+  int Y, Mo, D, h, mi, s;
+  char u[26] = "?";
+  if (clk::utc(Y, Mo, D, h, mi, s))
+    snprintf(u, sizeof(u), "%04d-%02d-%02d %02d:%02d:%02d", Y, Mo, D, h, mi, s);
+  char line[128];
+  snprintf(line, sizeof(line), "#BOOT %s rst=%s utc=%s clk=%s\n", ver, rst, u, clk::srcTag());
+  f.print(line);
+  f.flush();
+  nLines = 0;
+}
+
+inline void append(const char* s) {
+  if (!ready) return;
+  if (!f) f = LittleFS.open(kPath, FILE_APPEND);
+  if (!f) { ++nErr; return; }
+  const size_t want = strlen(s);
+  const size_t got  = f.write((const uint8_t*)s, want);
+  const size_t nl   = f.write((const uint8_t*)"\n", 1);
+  if (got != want || nl != 1) ++nErr;
+  ++nLines;
+  const uint32_t now = millis();
+  if (lastFlushMs == 0) lastFlushMs = now;
+  if (now - lastFlushMs >= kFlushMs) { f.flush(); lastFlushMs = now; }
+}
+
+inline void flushNow() { if (f) f.flush(); }
+
+// 把文件原样吐回串口(明天接回电脑后 `o dump` 一条命令取走全部数据)。
+inline void dump() {
+  if (!ready && !begin()) return;
+  flushNow();
+  File r = LittleFS.open(kPath, FILE_READ);
+  if (!r) { Serial.printf("[rec] %s 不存在(还没采到东西)\n", kPath); return; }
+  const size_t sz = r.size();
+  Serial.printf("[rec] dump %s  %u 字节 —— 开始\n", kPath, (unsigned)sz);
+  uint8_t buf[512];
+  size_t total = 0;
+  while (r.available()) {
+    const size_t n = r.read(buf, sizeof(buf));
+    if (!n) break;
+    Serial.write(buf, n);
+    total += n;
+    if ((total % 8192u) < sizeof(buf)) { Serial.flush(); yield(); }   // 防 USB 缓冲积压卡主循环
+  }
+  r.close();
+  Serial.printf("\n[rec] dump done %u 字节\n", (unsigned)total);
+}
+
+inline void clear() {
+  if (f) { f.flush(); f.close(); }
+  if (!ready) { if (!begin()) return; }
+  bool ok = true;
+  if (LittleFS.exists(kPath)) ok = LittleFS.remove(kPath);
+  nLines = 0; nErr = 0; lastFlushMs = 0;
+  f = LittleFS.open(kPath, FILE_APPEND);          // 立刻重开,后续 append 不用再判空
+  Serial.printf("[rec] 清空 %s : %s | 剩余 %u/%u B 已用\n", kPath, ok ? "ok" : "失败",
+                (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+}
+
+inline void stat() {
+  if (!ready && !begin()) return;
+  flushNow();
+  File r = LittleFS.open(kPath, FILE_READ);
+  const size_t sz = r ? r.size() : 0;
+  if (r) r.close();
+  Serial.printf("[rec] %s | 文件 %u B | 本次开机写了 %lu 行 | 写失败 %lu 次 | 分区 %u/%u B\n",
+                kPath, (unsigned)sz, (unsigned long)nLines, (unsigned long)nErr,
+                (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+}
+
+// ---- autostart:标志存 NVS,重启后自动续采(无人值守中途复位不丢采集)----
+inline bool autoOn() {
+  prefs.begin(kNvsName, true);
+  const bool v = prefs.getBool("auto", false);
+  prefs.end();
+  return v;
+}
+inline void setAuto(bool v) {
+  prefs.begin(kNvsName, false);
+  prefs.putBool("auto", v);
+  prefs.end();
+}
+
+}  // namespace rec
+
 namespace disp {
 
 static TFT_eSPI tft;
@@ -2673,20 +3488,16 @@ inline void releaseMain() {
 // "这块表坏了")。改时区只动下面 CLK_TZ_HOURS 一个数(西五区写 -5),跨日会自己进位。
 // 串口的 utc 字段、报文窗里的 ZDA 一律仍是**原始 UTC** —— 两边一对就知道换算对不对。
 constexpr int CLK_TZ_HOURS = 8;
-static bool isLeapYear(int y) { return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0); }
-static int  daysInMonth(int y, int m) {
-  static const int dm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-  if (m == 2 && isLeapYear(y)) return 29;
-  return dm[m - 1];
-}
 
-// 取不到时间(还没收到 ZDA / 超过 3 秒没更新)时 ok = false。
+
+// 取不到时间(两个源都没了)时 ok = false。
+// ★ v1.14.0:时间改从 clk 拿 —— 它自己会走,GNSS 断了由 DS3231 顶上。
+//   以前这里直接读报文,失锁 3 s 就变 ****;现在只有"GNSS 与 DS3231 都不行"
+//   才会显示星号,而那种情况本身就该显示星号。
 static void localYmdHms(int& Y, int& Mo, int& D, int& h, int& mi, int& s, bool& ok) {
-  bool stale = (nmea::st.utcMs == 0) || (millis() - nmea::st.utcMs > 3000);
-  ok = nmea::st.utcValid && !stale;
+  ok = clk::utc(Y, Mo, D, h, mi, s);
 
-  Y = nmea::st.uY; Mo = nmea::st.uMo; D = nmea::st.uD;
-  long sod = (long)nmea::st.uH * 3600 + (long)nmea::st.uMi * 60 + (long)nmea::st.uS
+  long sod = (long)h * 3600 + (long)mi * 60 + (long)s
            + (long)CLK_TZ_HOURS * 3600;
   while (sod < 0) {                 // 西时区:往昨天借
     sod += 86400;
@@ -2718,7 +3529,15 @@ static void buildHud(HudTxt o[4]) {
   localYmdHms(Y, Mo, D, h, mi, s, ok);
   if (ok) {
     snprintf(o[0].l1, sizeof(o[0].l1), "%04d-%02d-%02d", Y, Mo, D);
-    snprintf(o[0].l2, sizeof(o[0].l2), "%02d:%02d:%02d", h, mi, s);
+    // ★ v1.14.0:holdover 时在时间行尾挂 " RTC" 角标 —— 与 SAV/NEW 同一套做法:
+    //   不新开状态词(那会和 LOST / SIG-ABNORMAL 抢同一个位置),而是给
+    //   "这个时间"单独贴个来源标签。"信号状态"和"时间来源"本来就是两维。
+    //   宽度核算:最宽 "23:59:59 RTC" = 12 字符 × 6px = 72px,
+    //   块内起 x+4 -> 右端 76px < HUD_W(92),余 16px。够。
+    if (clk::isHoldover())
+      snprintf(o[0].l2, sizeof(o[0].l2), "%02d:%02d:%02d RTC", h, mi, s);
+    else
+      snprintf(o[0].l2, sizeof(o[0].l2), "%02d:%02d:%02d", h, mi, s);
   } else {
     strcpy(o[0].l1, "****-**-**");
     strcpy(o[0].l2, "**:**:**");
@@ -3989,6 +4808,9 @@ inline int hitAction(int x, int y) {
 //  ★ NVS 写入会阻塞 50~200 ms,所以只落在**主循环收尾**(eventlog::poll 在 loop 末尾)。
 //  ★ 滚动用整块 sprite 重绘(不玩硬件 VSCRDEF):绝对不闪;不追求丝滑,够看就行。
 // ============================================================================
+// ★ v1.14.5:事件落笔处要同步推一包 UDP —— pushw 定义在后面,先声明。
+namespace pushw { inline void evtOnStart(); }
+
 namespace eventlog {
 
 constexpr int         kMaxEvt   = 500;      // 事件池(FIFO 500 条)
@@ -4088,12 +4910,18 @@ inline const EventRec& at(int idx) {
   return pool[(seqCur - 1u - (uint32_t)idx + (uint32_t)(kMaxEvt * 4)) % (uint32_t)kMaxEvt];
 }
 
+// ★ v1.14.0:事件时间戳走 clk —— 这是"时间不断档"真正兑现的地方。
+//   以前失锁就等于事件时间的源断了;现在 GNSS 断了由 DS3231 撑住,
+//   "干扰何时开始/持续多久"这件事才记得下来。
+//   兜底:clk 两个源都没了(极端)时退回报文里的旧值 —— 时间会陈旧,
+//   但不会变成 0 把"跨日时长"算成 86400 多。
 inline uint32_t nowSod() {                   // 当天秒(UTC)
+  const uint32_t v = clk::sod();
+  if (v) return v;
   return (uint32_t)nmea::st.uH * 3600u + (uint32_t)nmea::st.uMi * 60u + (uint32_t)nmea::st.uS;
 }
 inline void nowDate(char* out, size_t n) {
-  if (nmea::st.utcValid) snprintf(out, n, "%02d-%02d", nmea::st.uMo, nmea::st.uD);
-  else                   snprintf(out, n, "??-??");
+  clk::date(out, n);
 }
 
 // 抓"最近一条 GGA 原文"(事件起始证据;池里从最新往回找)
@@ -4204,9 +5032,17 @@ inline void startEvent(int type) {
   e.t1     = 0;
   e.type   = (uint8_t)type;
   e.closed = 0;
+  // ★ v1.14.3(2026-10-28):off 的"没有可比性"改用**明确哨兵 -300.0 m**,不再钳成 0。
+  //   为什么改:10-27 夜 100 条事件里,凡是没有基准/没有 fix 的记录,off 列全是 0.0 ——
+  //   那是下面这行 `if (od < 0) od = 0` 把 offsetM = -1 钳出来的。
+  //   **0.0 在 CSV 里是个合法测量值**(真的没偏),却被拿来当"不知道" ⇒ 读表的人会
+  //   误以为那一夜偏了 0 米。这与本项目"屏幕/数据不许说谎"是同一条原则。
+  //   改法:① 哨兵 = -3000(即 -300.0 m),和 obs 行的 -1.0 语义对齐(都是"没有");
+  //         ② 上限 3000 保留(300 m 以上偏差本项目不可能真实出现,原语义不变);
+  //         ③ 负偏移照实记 —— 原来负数一律钳 0,把"往反方向偏"也吞了(同一类谎言)。
   int od = (int)(judge::res.offsetM * 10.0f + 0.5f);
-  if (od > 3000) od = 3000;
-  if (od < 0)    od = 0;
+  if (!judge::baseSet || !nmea::st.fixValid) od = -3000;   // -300.0 m = 没有可比性
+  else if (od > 3000) od = 3000;                            // 300.0 m 上限(原语义)
   e.offDm  = (int16_t)od;
   latestGga(e.gga, sizeof(e.gga));
   // ★ v1.12.0(A9):事件开始瞬间取一次温湿度快照(只在事件开始取,恢复时不取 ——
@@ -4229,6 +5065,7 @@ inline void startEvent(int type) {
   needPaint = true;
   Serial.printf("[evt] BEGIN #%lu %s off=%.0fm\n",
                 (unsigned long)e.seq, phrase::text((phrase::PhraseId)type), judge::res.offsetM);
+  pushw::evtOnStart();          // ★ v1.14.5:事件落笔处同步推一包(事件少,允许即发)
 }
 
 // ---- 事件恢复:补写同一条 ----
@@ -4241,6 +5078,30 @@ inline uint32_t durOf(const EventRec& e, bool* cross) {
   if (e.t1 >= e.t0)          return e.t1 - e.t0;
   if (cross) *cross = true;
   return 86400u - e.t0 + e.t1;                       // 跨 UTC 零点
+}
+
+// ★ v1.14.5:事件行的**唯一**格式化入口 —— `e dump` 与 UDP 的 W1,EVT 包共用这一份。
+//   为什么抽出来:两处各写一遍,下次给事件加字段必然漏一处(与 durOf 同一条纪律)。
+//   列序 = seq,date,t0_utc,t1_utc,crossday,dur_s,type,closed,off_m,temp_c,rh_pct,gga,cause
+//   ⚠ 行尾**不带换行** —— 串口侧自己补 "\n",UDP 侧一包一行不带 CRLF。
+inline void fmtCsv(const EventRec& r, char* out, size_t cap) {
+  bool cr = false;
+  const uint32_t dur = durOf(r, &cr);
+  // ★ 缓冲区 12 B:最坏 "23:59:59" = 8 字符 + NUL,但 GCC 的 -Wformat-truncation
+  //   按"分/秒两位数都可能进位"算到 11+1,给 10 会报 truncation 警告(编译零警告红线)。
+  char t0s[16] = "", t1s[16] = "", tc[16] = "", rh[8] = "";
+  snprintf(t0s, sizeof(t0s), "%02lu:%02lu:%02lu", (unsigned long)(r.t0 / 3600u),
+           (unsigned long)((r.t0 / 60u) % 60u), (unsigned long)(r.t0 % 60u));
+  if (r.closed && r.t1)
+    snprintf(t1s, sizeof(t1s), "%02lu:%02lu:%02lu", (unsigned long)(r.t1 / 3600u),
+             (unsigned long)((r.t1 / 60u) % 60u), (unsigned long)(r.t1 % 60u));
+  if (r.tC10 != (int16_t)0x7FFF) snprintf(tc, sizeof(tc), "%.1f", r.tC10 / 10.0f);
+  if (r.rh != 0xFF)              snprintf(rh, sizeof(rh), "%u", (unsigned)r.rh);
+  snprintf(out, cap, "%lu,%s,%s,%s,%d,%lu,%s,%d,%.1f,%s,%s,\"%s\",%s",
+           (unsigned long)r.seq, r.date, t0s, t1s, cr ? 1 : 0,
+           (unsigned long)dur, phrase::text((phrase::PhraseId)r.type),
+           r.closed ? 1 : 0, r.offDm / 10.0f, tc, rh, r.gga,
+           judge::causeName((judge::Cause)r.cause));
 }
 
 inline void closeEvent() {
@@ -4576,7 +5437,10 @@ inline void paintDetail() {
     snprintf(b, sizeof(b), "%lu s%s", (unsigned long)dur, cr ? " +1d" : "");
   } else                                        strcpy(b, "--");
   spr->drawString(b, 46, y + 42);
-  snprintf(b, sizeof(b), "%.1f m", e.offDm / 10.0f);
+  // ★ v1.14.3:offDm = -3000(=-300.0 m)是"当时没有基准/没有 fix"的哨兵 ——
+  //   屏上打 `---`,不能打 `-300.0 m`(那是在替一次没发生的测量编数字)。
+  if (e.offDm <= -3000) strcpy(b, "---");
+  else                  snprintf(b, sizeof(b), "%.1f m", e.offDm / 10.0f);
   spr->drawString(b, 46, y + 56);
   // ★ v1.13.0(B5):归因一行,插在 off 之后。老记录 cause=0 → 显示 "---"(是"当时没记",不是丢数)。
   spr->setTextColor(CLR_INK2, CLR_PAPER);
@@ -4755,6 +5619,33 @@ inline void reqStat() {
   char b[80];
   fmtStats(b, sizeof(b));
   txPush(b);
+}
+
+// ★ v1.14.1:清空事件池 + 统计(串口 'x' 用)。
+//   为什么需要:换场地/换试验前,旧事件仍在 500 条 FIFO 里,屏上分不清
+//   "这次开机记的"和"上次留下的";seq 从 #1 重新数,判读才对得上。
+//   ⚠ 只清 "gnsevt" 命名空间 —— 与 judge 的 base、触摸校准、WiFi 台账分开,
+//     清事件**不会**动基准(清基准是 'b' 命令,两件事别混)。
+//   ★★ v1.14.2 修(2026-10-27 烧后实测抓到的活 bug):这里**不许** prefs.end()。
+//     本模块的 `prefs` 是 begin() 打开、**全模块共用**的句柄,saveOne()/saveStat()/
+//     putUInt("seq") 全都直接拿它用。v1.14.1 在 clear() 之后 end() 了它 ⇒
+//     敲完 x 的**下一条**写入立刻失败:实测串口紧接着吐
+//     `[bench] evt: NVS write FAILED (stat)`,而且此后整晚的**事件一条都存不进 NVS**
+//     —— 屏上看着有、断电就全丢,典型的"静默失灵"。
+//     正确做法:句柄保持打开(与 eventlog::begin() 一致),并**立刻**把清零后的
+//     统计与序号写回去(硬教训 #8:记录 + 索引一起写),别等下一次 poll 才落。
+inline void clearAll() {
+  prefs.begin(kNvsName, false);
+  prefs.clear();
+  memset(pool, 0, sizeof(pool));
+  seqCur = 0;  nHave = 0;
+  curType = -1;
+  stTotSec = stOnlineSec = stOkSec = 0;
+  stSumSats = 0; stSumCn0x10 = 0;  stNSats = 0;
+  prefs.putUInt("seq", 0);        // 索引
+  saveStat();                     // 统计
+  needPaint = true;
+  Serial.println("[evt] 事件池已清空(0 条),统计归零,基准未动");
 }
 
 }  // namespace eventlog
@@ -5589,6 +6480,9 @@ static void serialReport(bool force);   // 前置声明,串口命令 s 会用到
 //     就是它开机就在连一条连不上的存档网,连接尝试一直挂着。
 //     S3 当时扫得动只是因为它的存档是**空的**;一旦存进任何一条,它也会得同样的病。
 // ============================================================================
+// ★ v1.14.5:UDP 推流子命令(`w push ...`)交给 pushw(全局命名空间,定义在本段之后)。
+namespace pushw { inline void cmd(const char* a1, const char* rest); }
+
 namespace wifi10 {
 
 constexpr int         kMax     = 10;
@@ -6233,7 +7127,8 @@ static void cmd(const char* args) {
   char op[8] = "", a1[40] = "", a2[72] = "";
   int  nscan = sscanf(args, "%7s %39s %71[^\n]", op, a1, a2);
   const char* p2 = (nscan >= 3) ? a2 : "";
-  if      (!strcmp(op, "list"))                 listCmd();
+  if      (!strcmp(op, "push"))                  pushw::cmd(a1, p2);        // ★ v1.14.5
+  else if (!strcmp(op, "list"))                 listCmd();
   else if (!strcmp(op, "add") && nscan >= 2)    startConnect(a1, p2);   // ★ 连上才存
   else if (!strcmp(op, "seed") && nscan >= 2) { // 只写台账不连(C3 的 PUSH 用)
     insertFront(a1, p2); saveAll();
@@ -6477,7 +7372,23 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      交互:设基准 10 s 采样中,BASE 键面直接显示 **CANCEL**(倒计时数字不再显示,
 //         顶部进度条照走),点它=取消本次采样(不落盘不动基准;串口/C3 的 b 维持
 //         原提示,产线重复发包不误取消)。
-constexpr const char* kVer   = "v1.13.1";
+//   ★ v1.14.2(2026-10-27 晚,烧后实测抓到的活 bug):`x` 清事件池之后
+//      prefs 句柄被 end() 掉 ⇒ 此后整晚事件写不进 NVS(串口只吐一行
+//      "NVS write FAILED (stat)",屏上看着正常、断电全丢)。修法见 eventlog::clearAll()。
+//      无其它行为改动。
+//   ★ v1.14.3(2026-10-28,首夜 16h 长挂数据的回填修正 —— "数据不许说谎"):
+//      事件记录里 off 的哨兵原本钳 0(`if (od<0) od=0`),于是**没有基准/没有 fix**
+//      的事件在 CSV 里显示 0.0 m —— 与"真的没偏"长得一模一样。改:
+//      哨兵 = -300.0 m(详情页打 `---`)、上限 300 m 保留、**负偏移照实记**(原来也钳 0)。
+//      ⚠ 旧记录里已有的 0.0 无法区分,读 10-27 夜的数据时要记得:那批 0.0 全是"没基准"。
+//   ★ v1.14.5(2026-10-30,任务单-2026-10-30-4「S3 WiFi 推流 + 本地看板」):
+//      新增 pushw 命名空间 —— 把串口上**已经在吐的东西**原样多送一份到 PC(UDP 9911)。
+//      四条纪律:① 只读现成变量,零新计算、零改判据、协议 P2 与 C3 侧一行不动;
+//      ② 默认关闭,`w push <ip> [port] [save]` 显式开,save 过才开机续推;
+//      ③ 发送绝不阻塞主循环(失败只计数丢弃,不重试不 delay);④ WiFi 未连时全静默。
+//      包格式 W1,OBS/EVT/HB/SKY/STA —— OBS 与 `o dump` 逐列同构,回放脚本不用改。
+//      ⚠ 北斗不进 SKY 包:本模块 GSV 不报 el/az,是数据事实不是漏发。
+constexpr const char* kVer   = "v1.14.5";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -6907,9 +7818,9 @@ inline void poll() {
 
 static void printHelp() {
 #if ENABLE_INJ
-  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan  e=evt dump CSV  o=obs toggle  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
 #else
-  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  w=wifi add/seed/try/list/del/conn/scan  e=evt dump CSV  o=obs toggle  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
 #endif
   // v1.5.17:`wadd` 语义变了 —— 现在是"**连上才存**"(不是存了再连);
   //         另加 `wseed <ssid> <pass>` = 只写台账不连(C3 的 PUSH 走这条)。
@@ -6941,8 +7852,255 @@ static void printHelp() {
 static bool gTouchRebootPend = false;
 
 // ★ v1.13.0(B6):obs 观测行开关 —— 纯 RAM,重启默认 off(故意不进 NVS:忘了关无害)。
+// ★ v1.14.1 改口:开了落盘之后,autostart 标志反而**必须**进 NVS —— 无人值守中途
+//   复位不能把采集断掉(见 rec::autoOn)。gObsOn 本身仍是运行时状态。
 static bool     gObsOn     = false;
 static uint32_t gObsLastMs = 0;
+
+// ★ v1.14.1:静默模式 —— 关掉所有周期性串口输出(s serialReport / obs 串口镜像)。
+//   为什么必须有它:不带电脑时 USB CDC 没有主机,每 5 s 两行 printf 的写入会等发送
+//   超时(不是无限阻塞,但每拍白等一两百毫秒),把 GNSS 解析的节拍拖毛。
+//   无人值守就只落文件,一个字都不往串口吐。临时要看:敲 'q' 打开输出。
+static bool     gQuiet      = false;
+
+
+// ============================================================================
+//  第 5.5 段:pushw —— WiFi UDP 实时推流  ★ v1.14.5 新增(任务单-2026-10-30-4)
+// ----------------------------------------------------------------------------
+//  一句话:**串口上已经在吐的东西,原样多送一份到 PC**,别的一律不动。
+//
+//  四条纪律(违反任一条即返工,与任务单 §1.4 同文):
+//   ① 只读现成变量 —— 零新计算、零改判据、协议 P2 零改动、C3 侧一行不动;
+//   ② 默认关闭 —— 只有 `w push <ip> [port] [save]` 显式开;save 过目标才在重启后续推;
+//   ③ **绝不阻塞主循环** —— endPacket 失败只计数丢弃,不重试、不 delay;
+//   ④ WiFi 没连上时全静默,不打印任何周期性日志(printf 哨兵纪律照旧)。
+//
+//  gQuiet 只管串口,不管 UDP(任务单 §1.3 明文);`q` 不影响推流。
+//
+//  包格式(W1 = 推流协议版本,与双板 P2 协议无关;纯 ASCII,一包一行,不加 CRLF):
+//    W1,OBS,<seq>,<串口 obs 行去掉行首 "OBS," 的 17 列>   ← 同一拍、同一份字符串
+//    W1,EVT,<seq>,<e dump 的整行>                        ← 事件落笔瞬间发
+//    W1,HB ,<seq>,<uptime_s>,<heap_free>,<obs_tx>,<evt_tx>
+//    W1,SKY,<seq>,<G|B|E|R><svid>,<az>,<el>,<cn0>;...
+//    W1,STA,<seq>,<qual>,<satsView>,<satsUsed>,<hdop>,<tsrc>
+//
+//  ⚠ 北斗**不会出现在 SKY 包里** —— 本模块 GSV 不报 el/az(nmea::SatFix 注释:
+//    实机 59/59 颗 el<0),talkers[] 里根本没有那些星。这是数据事实,不是漏发;
+//    "可见星数"里仍计入北斗(GGA/GSV 的 VIEW)。
+// ============================================================================
+namespace pushw {
+
+constexpr uint16_t    kDefaultPort = 9911;
+constexpr uint16_t    kLocalPort   = 9912;      // 本地绑定口(UDP 发送也要先 bind)
+constexpr const char* kNvsName     = "gnspush"; // 只存 ip/port/auto 三个键,与其它命名空间分开
+
+static bool      on     = false;   // 运行时开关(默认关)
+static bool      saved  = false;   // NVS 里有保存目标 = 允许开机续推
+static bool      begun  = false;   // UDP socket 是否已 bind
+static IPAddress tgt;              // 目标地址
+static uint16_t  tgtPort = kDefaultPort;
+static WiFiUDP   udp;
+
+static uint32_t  lastTxMs = 0;     // 最后一次发送尝试(millis)
+static uint32_t  txOk = 0, txErr = 0;
+static uint32_t  nObs = 0, nEvt = 0, nHb = 0, nSky = 0, nSta = 0;
+static uint32_t  sObs = 0, sEvt = 0, sHb = 0, sSky = 0, sSta = 0;   // 每类独立序号
+static uint32_t  tSky = 0, tHb = 0;
+static bool      linkUp = false;
+
+static void ipText(char* out, size_t n) {
+  snprintf(out, n, "%u.%u.%u.%u", tgt[0], tgt[1], tgt[2], tgt[3]);
+}
+
+// ---- NVS:只写 ip/port/auto 三个键(红线:除自己的键,其它 NVS 布局零改动)----
+static void saveCfg() {
+  Preferences p;
+  if (!p.begin(kNvsName, false)) { Serial.println("[push] NVS open FAILED (save)"); return; }
+  const uint32_t ip = ((uint32_t)tgt[0] << 24) | ((uint32_t)tgt[1] << 16) |
+                      ((uint32_t)tgt[2] << 8)  |  (uint32_t)tgt[3];
+  p.putUInt("ip", ip);
+  p.putUShort("port", tgtPort);
+  p.putBool("auto", true);
+  p.end();
+  saved = true;
+}
+
+inline void begin() {                       // setup 里调一次:只读,不开流
+  Preferences p;
+  if (!p.begin(kNvsName, true)) return;
+  const bool      a  = p.getBool("auto", false);
+  const uint32_t  ip = p.getUInt("ip", 0);
+  const uint16_t  pt = p.getUShort("port", kDefaultPort);
+  p.end();
+  if (!a || ip == 0) return;
+  tgt = IPAddress((uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8), (uint8_t)ip);
+  tgtPort = pt ? pt : kDefaultPort;
+  saved = true;
+  char b[24]; ipText(b, sizeof(b));
+  Serial.printf("[push] saved target %s:%u -- waiting for WiFi (auto resume)\n", b, tgtPort);
+}
+
+// 唯一的发送出口。失败只计数:PC 关机是正常工况,不能拖住台架。
+static bool sendLine(const char* s) {
+  if (!on) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!begun) {
+    begun = (udp.begin(kLocalPort) == 1);
+    if (!begun) { Serial.printf("[push] udp bind %u FAILED\n", kLocalPort); return false; }
+  }
+  udp.beginPacket(tgt, tgtPort);
+  udp.write((const uint8_t*)s, strlen(s));
+  const int r = udp.endPacket();
+  lastTxMs = millis();
+  if (r == 1) { ++txOk; return true; }
+  ++txErr;
+  return false;
+}
+
+inline void obs(const char* line) {          // 与串口 obs 同一拍、同一个字符串
+  if (!on || strncmp(line, "OBS,", 4) != 0) return;
+  char b[320];
+  snprintf(b, sizeof(b), "W1,OBS,%lu,%s", (unsigned long)++sObs, line + 4);
+  if (sendLine(b)) ++nObs;
+}
+
+inline void sta() {                          // 与 OBS 同拍(任务单 §1.2)
+  if (!on) return;
+  char b[128];
+  snprintf(b, sizeof(b), "W1,STA,%lu,%d,%d,%d,%.2f,%s",
+           (unsigned long)++sSta,
+           nmea::st.quality, nmea::st.satsView, nmea::st.satsUsed,
+           nmea::st.hdop, clk::srcTag());
+  if (sendLine(b)) ++nSta;
+}
+
+// 星座字母按 GSV 谈话头归属:GP→G / BD、GB→B / GA→E / GL→R
+static char constLetter(const char* id) {
+  if (!strcmp(id, "GP")) return 'G';
+  if (!strcmp(id, "BD") || !strcmp(id, "GB")) return 'B';
+  if (!strcmp(id, "GA")) return 'E';
+  if (!strcmp(id, "GL")) return 'R';
+  return 0;
+}
+
+inline void sky() {                          // 每 10 s 一包;条目多,允许超 480 B
+  if (!on) return;
+  char   b[960];
+  int    n = snprintf(b, sizeof(b), "W1,SKY,%lu", (unsigned long)++sSky);
+  for (int ti = 0; ti < nmea::talkerN; ++ti) {
+    const nmea::Talker& t = nmea::talkers[ti];
+    const char cc = constLetter(t.id);
+    if (!cc) continue;
+    for (int si = 0; si < t.satN; ++si) {
+      const nmea::SatFix& f = t.sat[si];
+      if (n > (int)sizeof(b) - 32) break;    // 塞不下就停(不截断半条)
+      // cn0 = 0 是"看得见但没信号"(GSV 该字段为空),照实发 0 —— 不编成 -1。
+      n += snprintf(b + n, sizeof(b) - n, ";%c%02u,%d,%d,%u",
+                    cc, (unsigned)f.prn, (int)f.az, (int)f.el, (unsigned)f.cn0);
+    }
+  }
+  if (sendLine(b)) ++nSky;
+}
+
+inline void hb() {                           // 每 15 s:让 PC 分清"设备死"与"网络抖"
+  if (!on) return;
+  char b[128];
+  snprintf(b, sizeof(b), "W1,HB,%lu,%lu,%lu,%lu,%lu",
+           (unsigned long)++sHb, (unsigned long)(millis() / 1000u),
+           (unsigned long)ESP.getFreeHeap(), (unsigned long)nObs, (unsigned long)nEvt);
+  if (sendLine(b)) ++nHb;
+}
+
+inline void evtOnStart() {                   // 由 eventlog::startEvent() 调用
+  if (!on || eventlog::nHave == 0) return;
+  char row[256], b[320];
+  eventlog::fmtCsv(eventlog::at(0), row, sizeof(row));   // 与 e dump 逐列同构
+  snprintf(b, sizeof(b), "W1,EVT,%lu,%s", (unsigned long)++sEvt, row);
+  if (sendLine(b)) ++nEvt;
+}
+
+inline void start(IPAddress ip, uint16_t port, bool save) {
+  tgt = ip;
+  tgtPort = port ? port : kDefaultPort;
+  on = true;
+  tSky = tHb = 0;                            // 立刻发首包,不等计时器
+  if (save) saveCfg();
+  if (!begun) begun = (udp.begin(kLocalPort) == 1);
+  char b[24]; ipText(b, sizeof(b));
+  Serial.printf("[push] -> %s:%u  (save=%s)\n", b, tgtPort, save ? "on" : "off");
+  if (!gObsOn)
+    Serial.println("[push] note: obs 未开 -> OBS/STA 不发(敲 o on 打开);SKY/HB 照发");
+}
+
+inline void stop() {
+  on = false;
+  Serial.println("[push] off (saved target kept -- 'w push clear' to delete)");
+}
+
+inline void clearSaved() {
+  Preferences p;
+  if (p.begin(kNvsName, false)) {
+    p.remove("ip"); p.remove("port"); p.remove("auto");
+    p.end();
+  }
+  saved = false;
+  Serial.println("[push] saved target cleared (runtime state unchanged)");
+}
+
+inline void status() {
+  char b[24] = "-";
+  if (tgt[0] | tgt[1] | tgt[2] | tgt[3]) ipText(b, sizeof(b));
+  const uint32_t ago = lastTxMs ? (millis() - lastTxMs) / 1000u : 0;
+  Serial.printf("[push] %s %s:%u | obs %lu evt %lu hb %lu sky %lu sta %lu | err %lu | last %lus ago | saved %s\n",
+                on ? "ON " : "off", b, tgtPort,
+                (unsigned long)nObs, (unsigned long)nEvt, (unsigned long)nHb,
+                (unsigned long)nSky, (unsigned long)nSta, (unsigned long)txErr,
+                (unsigned long)ago, saved ? "yes" : "no");
+}
+
+inline void tick(uint32_t now) {
+  const bool up = (WiFi.status() == WL_CONNECTED);
+  if (up != linkUp) {
+    linkUp = up;
+    if (up) begun = false;                   // 重连后重建 socket(旧 pcb 已随断链失效)
+  }
+  if (!on) {
+    if (saved && up) {                       // 开机自启:等 WiFi 就绪才接上
+      on = true; tSky = tHb = 0;
+      char b[24]; ipText(b, sizeof(b));
+      Serial.printf("[push] resume saved target %s:%u\n", b, tgtPort);
+    }
+    return;
+  }
+  if (!up) return;
+  if (now - tSky >= 10000u) { tSky = now; sky(); }
+  if (now - tHb  >= 15000u) { tHb  = now; hb();  }
+}
+
+// `w push <ip> [port] [save]` / `w push off|clear|status`
+inline void cmd(const char* a1, const char* rest) {
+  if (!a1 || !a1[0] || !strcmp(a1, "status")) { status(); return; }
+  if (!strcmp(a1, "off"))   { stop();       return; }
+  if (!strcmp(a1, "clear")) { clearSaved(); return; }
+
+  IPAddress ip;
+  if (!ip.fromString(a1)) {
+    Serial.println("[push] usage: w push <ip> [port] [save] | w push off | w push clear | w push status");
+    return;
+  }
+  uint16_t port = kDefaultPort;
+  bool     save = false;
+  char     b[48];
+  snprintf(b, sizeof(b), "%s", rest ? rest : "");
+  for (char* tok = strtok(b, " \t"); tok; tok = strtok(nullptr, " \t")) {
+    if (!strcmp(tok, "save")) { save = true; continue; }
+    const int v = atoi(tok);
+    if (v > 0 && v < 65536) port = (uint16_t)v;
+  }
+  start(ip, port, save);
+}
+
+}  // namespace pushw
 
 // ============================================================================
 //  ★ v1.12.0(A14-6b):控制台字符源 conGet() —— 带预读回放队列
@@ -7010,6 +8168,15 @@ static void consoleKey(char c) {
         sht::pollNow();
         Serial.printf("[bench] sht30 @0x%02X  %.1fC  %.0f%%RH  (%s)\n",
                       sht::addr, sht::tempC, sht::rhPct, sht::ok ? "ok" : "READ FAILED");
+        // ★ v1.14.0(F7):DS3231 自带温度计,顺手当 SHT30 的旁证。
+        //   注意它是**芯片自己的**温度,且寄存器 64 s 才更新一次 ——
+        //   和 SHT30 差 1~3℃ 属正常(位置不同 + DS3231 自热),别当故障。
+        if (ds3231::present) {
+          float t2;
+          if (ds3231::readTemp(t2)) { ds3231::tempC = t2; ds3231::tempOk = true; }
+          Serial.printf("[bench] ds3231 %.2fC  (芯片温度,旁证用;64s 更新一次)\n",
+                        ds3231::tempOk ? ds3231::tempC : -99.0f);
+        }
         char b[32];                      // ★ v1.5.20:回 C3
         snprintf(b, sizeof(b), "SHT %.1fC %.0f%%RH %s",
                  sht::tempC, sht::rhPct, sht::ok ? "ok" : "FAIL");
@@ -7160,30 +8327,77 @@ static void consoleKey(char c) {
         Serial.println("seq,date,t0_utc,t1_utc,crossday,dur_s,type,closed,off_m,temp_c,rh_pct,gga,cause");
         for (uint32_t i = 0; i < want; ++i) {
           const eventlog::EventRec& r = eventlog::at((int)i);   // at(0) = 最新
-          bool cr = false;
-          const uint32_t dur = eventlog::durOf(r, &cr);
-          char t0s[10] = "", t1s[10] = "", tc[16] = "", rh[8] = "";
-          snprintf(t0s, sizeof(t0s), "%02lu:%02lu:%02lu", (unsigned long)(r.t0 / 3600u),
-                   (unsigned long)((r.t0 / 60u) % 60u), (unsigned long)(r.t0 % 60u));
-          if (r.closed && r.t1)
-            snprintf(t1s, sizeof(t1s), "%02lu:%02lu:%02lu", (unsigned long)(r.t1 / 3600u),
-                     (unsigned long)((r.t1 / 60u) % 60u), (unsigned long)(r.t1 % 60u));
-          if (r.tC10 != (int16_t)0x7FFF) snprintf(tc, sizeof(tc), "%.1f", r.tC10 / 10.0f);
-          if (r.rh != 0xFF)              snprintf(rh, sizeof(rh), "%u", (unsigned)r.rh);
           // dump 中途不调 saveOne / 不改 pool —— 纯只读;每 20 条 yield 防 USB 缓冲积压卡判据
-          // ★ v1.13.0(B5):cause 列加在**最后**(插中间会让已存的 Excel 模板列错位)
-          Serial.printf("%lu,%s,%s,%s,%d,%lu,%s,%d,%.1f,%s,%s,\"%s\",%s\n",
-                        (unsigned long)r.seq, r.date, t0s, t1s, cr ? 1 : 0,
-                        (unsigned long)dur, phrase::text((phrase::PhraseId)r.type),
-                        r.closed ? 1 : 0, r.offDm / 10.0f, tc, rh, r.gga,
-                        judge::causeName((judge::Cause)r.cause));
+          // ★ v1.14.5:格式化抽到 eventlog::fmtCsv(),与 UDP 的 W1,EVT 包共用同一份。
+          char row[256];
+          eventlog::fmtCsv(r, row, sizeof(row));
+          Serial.printf("%s\n", row);
           if ((i % 20u) == 19u) yield();
         }
         Serial.printf("[evt] dump done (%lu rows)\n", (unsigned long)want);
         break;
       }
-      case 'o': {                        // ★ v1.13.0(B6):obs 观测行开关(不进白名单;不进 NVS)
-        // 敲的是整行("obs"),'o' 已读走,凑行尾只为校验拼写 —— 敲错就回 usage。
+      case 'o': {                        // ★ v1.14.1:obs 观测流(开关 / 落盘 / 导出)
+        // 敲的是整行,'o' 已读走,把行尾凑齐再解析(与 'e dump' 同一套)。
+        char ln[20]; int n = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 150) {
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
+            if (ch == '\n') break;
+            if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
+          }
+        }
+        ln[n] = 0;
+        char* q = ln;
+        while (*q == ' ') ++q;                              // ★ 必须跳前导空格(v1.12.0 栽过)
+        if (q[0] == 'b' && q[1] == 's' && q[2] == 0) q += 2; // 兼容旧敲法 "obs"
+        if (*q == 0) {                                      // 裸切换:临时看,不动 autostart
+          gObsOn = !gObsOn;
+          if (gObsOn) { rec::begin(); rec::stat(); }
+          else        { rec::flushNow(); }
+          Serial.printf("[bench] obs %s (5s/行; 落盘 %s)\n",
+                        gObsOn ? "ON" : "off", rec::ready ? "on" : "off");
+        } else if (!strcmp(q, "on")) {          // ★ 无人值守一键:开流 + 落盘 + 静默 + autostart
+          rec::begin();
+          gObsOn = true;
+          gQuiet = rec::ready;                  // 落盘挂了就不静默 —— 留串口当退路
+          rec::setAuto(true);
+          Serial.printf("[bench] obs ON | 落盘 %s | 静默 %s | autostart on\n",
+                        rec::ready ? "ok" : "FAIL", gQuiet ? "on" : "off");
+          rec::stat();
+        } else if (!strcmp(q, "off")) {
+          gObsOn = false;
+          rec::flushNow();
+          rec::setAuto(false);
+          gQuiet  = false;
+          Serial.println("[bench] obs off | 已 flush | autostart off | 静默 off");
+          rec::stat();
+        } else if (!strcmp(q, "dump")) {        // 明天接回电脑:一条命令取走全部数据
+          rec::dump();
+        } else if (!strcmp(q, "clear")) {
+          rec::clear();
+        } else if (!strcmp(q, "stat")) {
+          rec::stat();
+        } else {
+          Serial.println("[bench] o usage: o|obs=切换 | o on | o off | o dump | o clear | o stat");
+        }
+        break;
+      }
+      case 'x': {                        // ★ v1.14.1:清事件池(换场地/换试验前用)
+        eventlog::clearAll();
+        break;
+      }
+      case 'q': {                        // ★ v1.14.1:静默开关(临时接电脑要看输出时敲一下)
+        gQuiet = !gQuiet;
+        Serial.printf("[bench] quiet %s (自动状态行%s)\n",
+                      gQuiet ? "ON" : "off", gQuiet ? "不打印" : "可打印");
+        break;
+      }
+      case 'u': {                        // ★ v1.14.0:时钟诊断(UTC 源 / DS3231 / 相位差)
+        // 敲整行:"u" 打状态,"u sync" 立刻校一次钟。'u' 已读走,把行尾凑齐。
         char ln[12]; int n = 0;
         uint32_t t0 = millis();
         while (millis() - t0 < 100) {
@@ -7196,9 +8410,21 @@ static void consoleKey(char c) {
           }
         }
         ln[n] = 0;
-        if (strcmp(ln, "bs") != 0) { Serial.println("[bench] o usage: obs   (toggle 5s CSV row)"); break; }
-        gObsOn = !gObsOn;
-        Serial.printf("[bench] obs %s (every 5s; RAM only, off after reboot)\n", gObsOn ? "ON" : "off");
+        // ★ 必须跳过前导空格 —— v1.12.0 的 'e dump' 就栽在这:`strncmp` 拿
+        //   " dump" 去比 "dump" 永远不等,命令看着"发了没反应"。
+        char* q = ln;
+        while (*q == ' ') ++q;
+        if (*q == 0) {
+          clk::report();
+          pdomon::report();          // ★ v1.14.4:RTC 频率判据(短窗斜率 + 温度同步)
+        } else if (strcmp(q, "sync") == 0) {
+          if (clk::forceSync()) Serial.println("[bench] rtc: 已用 GNSS 校时");
+          else Serial.println("[bench] rtc: 校时跳过 —— GNSS 时间不新鲜,或 0x68 上没有芯片");
+          clk::report();
+          pdomon::report();
+        } else {
+          Serial.println("[bench] u usage: u | u sync");
+        }
         break;
       }
       case 'w': {                        // WiFi 子命令:wadd/wlist/wdel/wconn
@@ -7272,6 +8498,7 @@ static void serialReport(bool force) {
   static uint32_t t = 0;
   uint32_t now = millis();
   if (!force) {
+    if (gQuiet) return;                // ★ v1.14.1:静默模式 —— 自动状态行一个字都不吐
     if (!gLogOn) return;               // 日志安静模式:自动状态行不打印
     if (now - t < 5000) return;
   }
@@ -7300,13 +8527,19 @@ static void serialReport(bool force) {
   //                  正常运行在几十毫秒以内
   //                  (旧版 'l' 试灯每敲一次必产生一个约 8 秒的尖峰,v1.5.10 已删该命令;
   //                   现在若还见到 >1500ms,重点查 NVS 写入、首次 sprite 分配、WiFi 重连)
-  char utc[24];
-  if (!nmea::st.utcValid || (now - nmea::st.utcMs) > 3000) {
+  // ★ v1.14.0:utc 改走 clk(它自己会走,GNSS 断了由 DS3231 顶着),holdover 时挂 " RTC"。
+  //   缓冲 24 -> 28:"2026-10-26 11:52:03 RTC" = 23 字符 + 结尾 0 = 24,
+  //   压在原尺寸上正好是擦边(再长一个字符就截断),所以扩一点。
+  char utc[28];
+  int uy, umo, ud, uh, umi, us;
+  if (!clk::utc(uy, umo, ud, uh, umi, us)) {
     strcpy(utc, "****-**-** **:**:**");
+  } else if (clk::isHoldover()) {
+    snprintf(utc, sizeof(utc), "%04d-%02d-%02d %02d:%02d:%02d RTC",
+             uy, umo, ud, uh, umi, us);
   } else {
     snprintf(utc, sizeof(utc), "%04d-%02d-%02d %02d:%02d:%02d",
-             nmea::st.uY, nmea::st.uMo, nmea::st.uD,
-             nmea::st.uH, nmea::st.uMi, nmea::st.uS);
+             uy, umo, ud, uh, umi, us);
   }
   char bj[24];
   disp::clockText(bj, sizeof(bj));       // 屏上那串,原样取出(不重算)
@@ -7422,6 +8655,18 @@ void setup() {
                             //   ★ 必须在 judge::loadBase() 之后、主循环之前 —— 判据第一拍就要用
                             //     这些值,晚一拍就会出现"用出厂 30 m 判了一次"的假报警。
   eventlog::begin();        // ★ v1.7.0:载入事件池 + 统计累加器(gnsevt)
+  pushw::begin();           // ★ v1.14.5:读一次保存的推流目标(只读,等 WiFi 就绪再续推)
+
+  // ★ v1.14.1:观测落盘 —— 挂 LittleFS(spiffs 分区)并写一段开机头。
+  //   放在这里(存储类初始化同一片)而不是更早:此时 kVer 与复位原因都已确定,
+  //   开机头能一次把"哪次开机、被谁弄醒、钟是谁在撑"记全。
+  //   ★ 失败不致命:rec::append 内部会直接 return,采集退回"只吐串口"的老行为。
+  rec::bootHeader(splash::kVer, resetReasonText(esp_reset_reason()));
+  if (rec::autoOn()) {                 // 无人值守:上次开着的,重启后接着采
+    gObsOn = true;
+    gQuiet = rec::ready;
+    Serial.printf("[bench] obs autostart(GNSS 观测续采;静默 %s)\n", gQuiet ? "on" : "off");
+  }
 
   gnss::begin();
   pps::begin();             // PPS 秒脉冲中断(GPIO16)。只挂中断,不占主循环时间
@@ -7455,6 +8700,8 @@ void setup() {
   sht::begin();             // I2C 温湿度。必须排在 disp::begin() 之后 ——
                             // 屏/触摸初始化时 TFT_eSPI 会把自己配置的脚(TOUCH_CS=14 等)
                             // 过一遍,I2C 在其后 begin,拿回自己两条线的控制权
+  ds3231::begin();          // ★ v1.14.0:必须排在 sht::begin() 之后 ——
+                            // Wire 是 sht 那边 begin 的,这颗 RTC 与它共用同一条总线
   touch::begin();           // 必须在 disp::begin() 之后 —— 它要用 tft
 
   wifi10::begin();          // ★ v1.5.17:读 NVS 台账 -> 先异步扫 -> 只连"范围内 ∧ 已存档"里最强的
@@ -7479,6 +8726,9 @@ void loop() {
   nmea::drain();            // 2 解
   judge::update();          // 3 判
   sht::poll();              // 4 环境温湿度(内部自己按 2 秒节流)
+  ds3231::poll();           // 4.1 ★ v1.14.0:读 RTC(1 s 一次) + 温度(10 s 一次)
+  clk::poll();              // 4.2 ★ v1.14.0:时间源仲裁(GNSS 主 / DS3231 holdover)
+  pdomon::tick();           // 4.3 ★ v1.14.4:RTC 频率判据(1 min 一点,内部自己限速)
   readConsole();            // 5 串口命令(电脑 USB)
   wifi10::poll();           // ★ v1.5.17:① "连上才存"状态机 ② 收割异步扫描结果
                             //   (排在 benchlink::poll 之前 —— 连上/失败的回执同一圈就发出去)
@@ -7550,9 +8800,11 @@ void loop() {
 
   eventlog::poll();         // ★ v1.7.0:事件记录 + 统计。NVS 写全落在这里(主循环收尾)
 
-  // ★ v1.13.0(B6):obs 观测行 —— 每 5 s 一行 15 字段 CSV,全部取现成变量零新计算。
+  // ★ v1.13.0(B6):obs 观测行 —— 每 5 s 一行 CSV,全部取现成变量零新计算。
   //   P10 长挂 12h 的唯一数据来源,也是"改判据→旧数据离线回放"的地基。
   //   纪律:不进 NVS、不上屏、**不改判定逻辑** —— 它只是一台打印机。
+  // ★ v1.14.1:两条出口 —— ① 落 LittleFS 文件(无人值守的唯一生路)
+  //                          ② 串口镜像(有电脑、且没开静默时才吐)
   if (gObsOn && now - gObsLastMs >= 5000) {
     gObsLastMs = now;
     const bool  fix  = nmea::st.fixValid;
@@ -7560,20 +8812,40 @@ void loop() {
     const float offv = (fix && judge::baseSet) ? judge::res.offsetM : -1.0f;
     const float sogv = (fix && nmea::st.sogValid) ? nmea::st.sogMps : -1.0f;
     const bool  shtOk = sht::haveVal && !sht::stale;
-    Serial.printf("OBS,%lu,%d,%.2f,%.1f,%.1f,%d,%.1f,%.1f,%.2f,%.2f,%s,%s,%.1f,%.1f\n",
-                  (unsigned long)now,
-                  fix ? nmea::st.satsUsed : -1,
-                  fix ? nmea::st.hdop : -1.0f,
-                  (fix && nmea::st.cn0N > 0) ? nmea::st.cn0Median : -1.0f,
-                  (fix && nmea::st.cn0N > 0) ? nmea::st.cn0[nmea::st.cn0N - 1] : -1.0f,
-                  fix ? integ::mpCount() : -1,
-                  fix ? integ::mpPeak() : -1.0f,
-                  hplv, offv, sogv,
-                  fix ? judge::causeName(judge::res.cause) : "---",
-                  judge::res.tag,
-                  shtOk ? sht::tempC : -100.0f,
-                  shtOk ? sht::rhPct : -1.0f);
+    // ★ v1.14.0:尾插两列(一律加在最后 —— 插中间会让已存的离线脚本/表格列位错掉):
+    //   pdo  = SQW 与 PPS 的相位差(ms,1 位小数;正值 = SQW 落后 PPS)。
+    //          0 表示"任一边 >2 s 没脉冲"(失锁时 PPS 本来就没有,属正常),
+    //          这时输出 -1.0 而不是 0 —— 0 是个合法相位差,不能拿它当"没测到"。
+    //   tsrc = 时间源:G(NSS) / R(tc holdover) / -(不可信)。
+    //   ★ 判读要点:pdo 的**绝对值**没有意义(取决于上次校准时怎么对齐),
+    //     有信息的是它的**斜率**(= 两把表的频率差)。
+    // ★ v1.14.1:再尾插第 18 列 utc(Unix 秒,0 = 时间不可信)—— 见 clk::epoch() 注释。
+    const int32_t ph = clk::phaseUs();
+    char line[224];
+    snprintf(line, sizeof(line),
+             "OBS,%lu,%d,%.2f,%.1f,%.1f,%d,%.1f,%.1f,%.2f,%.2f,%s,%s,%.1f,%.1f,%.1f,%s,%lu",
+             (unsigned long)now,
+             fix ? nmea::st.satsUsed : -1,
+             fix ? nmea::st.hdop : -1.0f,
+             (fix && nmea::st.cn0N > 0) ? nmea::st.cn0Median : -1.0f,
+             (fix && nmea::st.cn0N > 0) ? nmea::st.cn0[nmea::st.cn0N - 1] : -1.0f,
+             fix ? integ::mpCount() : -1,
+             fix ? integ::mpPeak() : -1.0f,
+             hplv, offv, sogv,
+             fix ? judge::causeName(judge::res.cause) : "---",
+             judge::res.tag,
+             shtOk ? sht::tempC : -100.0f,
+             shtOk ? sht::rhPct : -1.0f,
+             (ph == 0) ? -1.0f : (float)ph / 1000.0f,
+             clk::srcTag(),
+             (unsigned long)clk::epoch());
+    rec::append(line);
+    if (!gQuiet) Serial.println(line);
+    pushw::obs(line);         // ★ v1.14.5:同一拍、同一份数据,多送一份到 PC
+    pushw::sta();             //      STA 与 OBS 同拍(任务单 §1.2)
   }
+
+  pushw::tick(now);         // ★ v1.14.5:SKY 10 s / HB 15 s / 开机续推(不阻塞)
 
   serialReport(false);      // 主循环里的自动打印,保持 5 秒一次
 }
