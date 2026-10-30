@@ -7441,7 +7441,7 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      ③ 发送绝不阻塞主循环(失败只计数丢弃,不重试不 delay);④ WiFi 未连时全静默。
 //      包格式 W1,OBS/EVT/HB/SKY/STA —— OBS 与 `o dump` 逐列同构,回放脚本不用改。
 //      ⚠ 北斗不进 SKY 包:本模块 GSV 不报 el/az,是数据事实不是漏发。
-constexpr const char* kVer   = "v1.14.6";
+constexpr const char* kVer   = "v1.14.7";
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -7918,9 +7918,16 @@ static bool     gQuiet      = false;
 
 
 // ============================================================================
-//  第 5.5 段:pushw —— WiFi UDP 实时推流  ★ v1.14.5 新增(任务单-2026-10-30-4)
+//  第 5.5 段:pushw —— WiFi 实时推流  ★ v1.14.5 新增(任务单-2026-10-30-4)
+//                                       ★ v1.14.7 加 TCP <-> UDP 双传输
 // ----------------------------------------------------------------------------
 //  一句话:**串口上已经在吐的东西,原样多送一份到 PC**,别的一律不动。
+//
+//  ★ v1.14.7:两种传输,`w push <ip> [port] [tcp|udp] [save]`,默认 UDP。
+//    · UDP —— 一包一行、不做分帧;丢一帧就是永失,但绝不阻塞。
+//    · TCP —— 行尾补 '\n' 分帧、断链自动重连(3 s 退避)、90 s 无成功写判半开。
+//      为了不阻塞主循环,connect/write 全在 core 0 的独立任务里,主循环只入队。
+//    口径不变:PC 关机/断网都只是"发不出去",板上 LittleFS 照记,`o dump` 能补。
 //
 //  四条纪律(违反任一条即返工,与任务单 §1.4 同文):
 //   ① 只读现成变量 —— 零新计算、零改判据、协议 P2 零改动、C3 侧一行不动;
@@ -7961,8 +7968,108 @@ static uint32_t  sObs = 0, sEvt = 0, sHb = 0, sSky = 0, sSta = 0;   // 每类独
 static uint32_t  tSky = 0, tHb = 0;
 static bool      linkUp = false;
 
+// ---- ★ v1.14.7:TCP 传输 ----
+//  为什么加它:UDP 丢一帧就是永失(2026-10-30 晚 21:41~21:45 成对丢过 8 拍 OBS/STA)。
+//  但 TCP 有个致命前提 —— **connect() 会阻塞,默认超时是秒级**。而 GNSS 串口
+//  9600 8N1 = 1 ms/字节,主循环停 1 s 就丢 ~960 B 原始字节,补不回来。
+//  所以:主循环只往环形缓冲塞字节(临界区几十微秒),socket 的 connect/write
+//  全部交给 core 0 上的独立任务。**这条是"能不能用 TCP"的唯一技术门槛。**
+constexpr size_t kRingSz = 6144;                  // ≈6 条 SKY 包 / 60 条 OBS 行
+static WiFiClient cli;
+static bool       useTcp   = false;               // 传输方式(随 save 一起进 NVS)
+static bool       taskRun  = false;
+static portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
+static char       ring[kRingSz];
+static volatile size_t rHead = 0, rTail = 0;      // 单生产者(主循环)/单消费者(任务)
+static uint32_t   nDrop = 0;                      // 缓冲满而丢的行数(只由主循环写,不必 volatile)
+static uint32_t   nReconn = 0, tConnTry = 0, okMs = 0;
+
 static void ipText(char* out, size_t n) {
   snprintf(out, n, "%u.%u.%u.%u", tgt[0], tgt[1], tgt[2], tgt[3]);
+}
+
+// 入队一行(自动补 '\n' —— TCP 是字节流,不补就没法分帧)。满了就丢并计数,绝不等待。
+static bool ringPut(const char* s, size_t len) {
+  if (len + 1 >= kRingSz) { ++nDrop; return false; }
+  taskENTER_CRITICAL(&ringMux);
+  const size_t used = (rHead + kRingSz - rTail) % kRingSz;
+  if (kRingSz - 1 - used < len + 1) {
+    taskEXIT_CRITICAL(&ringMux);
+    ++nDrop;
+    return false;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    ring[rHead] = s[i];
+    rHead = (rHead + 1) % kRingSz;
+  }
+  ring[rHead] = '\n';
+  rHead = (rHead + 1) % kRingSz;
+  taskEXIT_CRITICAL(&ringMux);
+  return true;
+}
+
+static void ringFlush() {
+  taskENTER_CRITICAL(&ringMux);
+  rTail = rHead;
+  taskEXIT_CRITICAL(&ringMux);
+}
+
+// 传输任务:只管 socket。连不上就退避 3 s,连上就把缓冲抽干。
+static void tcpTask(void*) {
+  char ipb[24];
+  for (;;) {
+    if (!on || !useTcp) { if (cli) cli.stop(); okMs = 0; vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+    if (WiFi.status() != WL_CONNECTED) { cli.stop(); okMs = 0; vTaskDelay(pdMS_TO_TICKS(300)); continue; }
+
+    if (!cli.connected()) {
+      okMs = 0;
+      if (millis() - tConnTry < 3000u) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+      tConnTry = millis();
+      ++nReconn;
+      cli.stop();
+      cli.setTimeout(2);                            // 写超时 2 s,别把任务挂死
+      if (!cli.connect(tgt, tgtPort, 2000)) {
+        ipText(ipb, sizeof(ipb));
+        Serial.printf("[push] tcp %s:%u connect FAILED (retry 3s)\n", ipb, tgtPort);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+      ringFlush();                                  // 断链期间攒的旧数据没意义,丢掉
+      okMs = lastTxMs = millis();
+      ipText(ipb, sizeof(ipb));
+      Serial.printf("[push] tcp connected %s:%u\n", ipb, tgtPort);
+    }
+
+    while (cli.connected()) {                       // 每轮最多 512 B,不长时间占临界区
+      uint8_t chunk[512];
+      size_t n = 0;
+      taskENTER_CRITICAL(&ringMux);
+      while (n < sizeof(chunk) && rTail != rHead) {
+        chunk[n++] = (uint8_t)ring[rTail];
+        rTail = (rTail + 1) % kRingSz;
+      }
+      taskEXIT_CRITICAL(&ringMux);
+      if (!n) break;
+      const size_t w = cli.write(chunk, n);
+      if (w != n) { ++txErr; cli.stop(); break; }
+      ++txOk;
+      okMs = lastTxMs = millis();
+    }
+
+    // 半开连接:AP 把人踢了但没发 RST,write 仍会"成功"一阵。90 s 没有一次成功写就重连。
+    if (okMs && millis() - okMs > 90000u) {
+      Serial.println("[push] tcp stalled 90s -> reconnect");
+      cli.stop();
+      okMs = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+static void startTask() {
+  if (taskRun) return;
+  taskRun = true;
+  xTaskCreatePinnedToCore(tcpTask, "pushTcp", 4096, nullptr, 1, nullptr, 0);
 }
 
 // ---- NVS:只写 ip/port/auto 三个键(红线:除自己的键,其它 NVS 布局零改动)----
@@ -7974,6 +8081,7 @@ static void saveCfg() {
   p.putUInt("ip", ip);
   p.putUShort("port", tgtPort);
   p.putBool("auto", true);
+  p.putBool("tcp", useTcp);                    // ★ v1.14.7:传输方式跟着目标一起记住
   p.end();
   saved = true;
 }
@@ -7984,19 +8092,26 @@ inline void begin() {                       // setup 里调一次:只读,不开�
   const bool      a  = p.getBool("auto", false);
   const uint32_t  ip = p.getUInt("ip", 0);
   const uint16_t  pt = p.getUShort("port", kDefaultPort);
+  const bool      tc = p.getBool("tcp", false);      // ★ v1.14.7
   p.end();
   if (!a || ip == 0) return;
   tgt = IPAddress((uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8), (uint8_t)ip);
   tgtPort = pt ? pt : kDefaultPort;
+  useTcp  = tc;
   saved = true;
   char b[24]; ipText(b, sizeof(b));
-  Serial.printf("[push] saved target %s:%u -- waiting for WiFi (auto resume)\n", b, tgtPort);
+  Serial.printf("[push] saved target %s:%u (%s) -- waiting for WiFi (auto resume)\n",
+                b, tgtPort, useTcp ? "TCP" : "UDP");
 }
 
 // 唯一的发送出口。失败只计数:PC 关机是正常工况,不能拖住台架。
 static bool sendLine(const char* s) {
   if (!on) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
+  if (useTcp) {                                // ★ v1.14.7:入队即返回,真发送在任务里
+    startTask();
+    return ringPut(s, strlen(s));
+  }
   if (!begun) {
     begun = (udp.begin(kLocalPort) == 1);
     if (!begun) { Serial.printf("[push] udp bind %u FAILED\n", kLocalPort); return false; }
@@ -8072,15 +8187,25 @@ inline void evtOnStart() {                   // 由 eventlog::startEvent() 调�
   if (sendLine(b)) ++nEvt;
 }
 
-inline void start(IPAddress ip, uint16_t port, bool save) {
+inline void start(IPAddress ip, uint16_t port, bool save, bool tcp) {
   tgt = ip;
   tgtPort = port ? port : kDefaultPort;
   on = true;
+  useTcp = tcp;                              // ★ v1.14.7
   tSky = tHb = 0;                            // 立刻发首包,不等计时器
   if (save) saveCfg();
-  if (!begun) begun = (udp.begin(kLocalPort) == 1);
+  if (useTcp) {
+    cli.stop();
+    tConnTry = 0;
+    ringFlush();                             // 切换目标时旧缓冲作废
+    startTask();
+  } else {
+    if (cli) cli.stop();                     // 从 TCP 切回 UDP,先把连接关掉
+    if (!begun) begun = (udp.begin(kLocalPort) == 1);
+  }
   char b[24]; ipText(b, sizeof(b));
-  Serial.printf("[push] -> %s:%u  (save=%s)\n", b, tgtPort, save ? "on" : "off");
+  Serial.printf("[push] -> %s:%u  (%s, save=%s)\n", b, tgtPort,
+                useTcp ? "TCP" : "UDP", save ? "on" : "off");
   if (!gObsOn)
     Serial.println("[push] note: obs 未开 -> OBS/STA 不发(敲 o on 打开);SKY/HB 照发");
 }
@@ -8093,7 +8218,7 @@ inline void stop() {
 inline void clearSaved() {
   Preferences p;
   if (p.begin(kNvsName, false)) {
-    p.remove("ip"); p.remove("port"); p.remove("auto");
+    p.remove("ip"); p.remove("port"); p.remove("auto"); p.remove("tcp");
     p.end();
   }
   saved = false;
@@ -8104,11 +8229,17 @@ inline void status() {
   char b[24] = "-";
   if (tgt[0] | tgt[1] | tgt[2] | tgt[3]) ipText(b, sizeof(b));
   const uint32_t ago = lastTxMs ? (millis() - lastTxMs) / 1000u : 0;
-  Serial.printf("[push] %s %s:%u | obs %lu evt %lu hb %lu sky %lu sta %lu | err %lu | last %lus ago | saved %s\n",
-                on ? "ON " : "off", b, tgtPort,
+  Serial.printf("[push] %s %s:%u | %s | obs %lu evt %lu hb %lu sky %lu sta %lu | err %lu | last %lus ago | saved %s\n",
+                on ? "ON " : "off", b, tgtPort, useTcp ? "TCP" : "UDP",
                 (unsigned long)nObs, (unsigned long)nEvt, (unsigned long)nHb,
                 (unsigned long)nSky, (unsigned long)nSta, (unsigned long)txErr,
                 (unsigned long)ago, saved ? "yes" : "no");
+  if (useTcp) {                              // ★ v1.14.7:TCP 独有的四个量
+    const size_t q = (rHead + kRingSz - rTail) % kRingSz;
+    Serial.printf("[push] tcp %s | queued %u B | drop %lu | reconn %lu | ok-sends %lu\n",
+                  cli.connected() ? "connected" : "down", (unsigned)q,
+                  (unsigned long)nDrop, (unsigned long)nReconn, (unsigned long)txOk);
+  }
 }
 
 inline void tick(uint32_t now) {
@@ -8120,8 +8251,9 @@ inline void tick(uint32_t now) {
   if (!on) {
     if (saved && up) {                       // 开机自启:等 WiFi 就绪才接上
       on = true; tSky = tHb = 0;
+      if (useTcp) startTask();               // ★ v1.14.7:TCP 模式下先把任务拉起来
       char b[24]; ipText(b, sizeof(b));
-      Serial.printf("[push] resume saved target %s:%u\n", b, tgtPort);
+      Serial.printf("[push] resume saved target %s:%u (%s)\n", b, tgtPort, useTcp ? "TCP" : "UDP");
     }
     return;
   }
@@ -8143,14 +8275,17 @@ inline void cmd(const char* a1, const char* rest) {
   }
   uint16_t port = kDefaultPort;
   bool     save = false;
+  bool     tcp  = false;                     // ★ v1.14.7:默认 UDP,行为向后兼容
   char     b[48];
   snprintf(b, sizeof(b), "%s", rest ? rest : "");
   for (char* tok = strtok(b, " \t"); tok; tok = strtok(nullptr, " \t")) {
     if (!strcmp(tok, "save")) { save = true; continue; }
+    if (!strcmp(tok, "tcp"))  { tcp  = true; continue; }
+    if (!strcmp(tok, "udp"))  { tcp  = false; continue; }
     const int v = atoi(tok);
     if (v > 0 && v < 65536) port = (uint16_t)v;
   }
-  start(ip, port, save);
+  start(ip, port, save, tcp);
 }
 
 }  // namespace pushw
