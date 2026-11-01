@@ -1,0 +1,3364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>GNSS SIGNAL &amp; PPS MONITOR · 深空终端</title>
+<style>
+:root{
+  /* ★ 2026-10-31 v9 配色：底色从纯黑抬到深蓝灰，扫描线/扫掠/暗角全部降强度。
+     原因：长时间盯"暗黄+暗蓝"两色大色块会视觉疲劳，先把环境噪音压下去。 */
+  --bg:#070d13;
+  --panel-a:rgba(10,18,25,.94);
+  --panel-b:rgba(6,12,18,.96);
+  --line:rgba(96,196,222,.15);
+  --line-soft:rgba(96,196,222,.07);
+  --cyan:#48d9f0;
+  --cyan-2:#1a8fae;
+  --text:#c6d7e2;
+  --dim:#6d8296;
+  --warn:#ff6b35;
+  --warn-2:#ffa07a;
+  --ok:#2fe08a;
+  --amber:#f5c542;
+  /* 星座双色：青绿 / 珊瑚 —— 色相拉开约 150°，明度接近，暗底上不刺眼 */
+  --sys-gps:#5fe3c0;
+  --sys-bds:#ffae7b;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:"JetBrains Mono","SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  font-size:12px;
+  overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+/* ---------- 背景：细网格 + 扫描线 + 暗角（★ v14：合成为一层静态图） ----------
+   ★ 2026-10-31 卡顿治理(第二轮)：原来这是三个 `position:fixed;inset:0` 的独立图层
+     （.bg-grid / .bg-scan / .vignette），每一帧都要由合成器把三张全屏渐变叠一遍。
+     它们**永远不动**，没有任何理由分层 —— 合成一个 background-image 列表，
+     光栅化一次、之后只做一次贴图。视觉逐像素等价（顺序即绘制顺序）。
+   ★ 扫光条原来动画的是 `top` —— 那会触发**每帧布局 + 整条重绘**（全宽 22vh），
+     是这页唯一持续不断的重绘源。改成 transform（合成器动画，零重绘）。 */
+.bg-static{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:
+    repeating-linear-gradient(0deg,rgba(180,235,255,.014) 0 1px,transparent 1px 4px),
+    linear-gradient(rgba(96,196,222,.035) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(96,196,222,.035) 1px,transparent 1px),
+    radial-gradient(ellipse at 50% 42%,rgba(20,80,104,.15),transparent 62%),
+    radial-gradient(ellipse at 50% 45%,transparent 52%,rgba(0,0,0,.42) 100%);
+  background-size:100% 4px,44px 44px,44px 44px,100% 100%,100% 100%;
+}
+.bg-sweep{
+  position:fixed;left:0;right:0;top:0;height:22vh;z-index:1;pointer-events:none;
+  background:linear-gradient(180deg,transparent,rgba(72,217,240,.022),transparent);
+  will-change:transform;
+  animation:sweep 14s linear infinite;
+}
+@keyframes sweep{from{transform:translate3d(0,-25vh,0)}to{transform:translate3d(0,105vh,0)}}
+/* ★ v15.1 轻量模式：机器本身吃紧（软件合成 / 别的程序抢 CPU）时的兜底。
+   关掉全屏扫光层与列表滑入动画、穹顶降到 30 fps。地址加 ?lite=1，或点右上角诊断条切换。 */
+.lite .bg-sweep{display:none}
+.lite .logrow{animation:none}
+.lite .chip.live i,.lite .lamp.on{animation:none}
+
+/* ---------- 布局 ---------- */
+.app{position:relative;z-index:4;height:100vh;display:flex;flex-direction:column}
+.hud{
+  height:44px;flex:0 0 44px;display:flex;align-items:center;gap:14px;
+  padding:0 14px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,rgba(10,20,28,.9),rgba(4,7,10,.5));
+}
+.brand{display:flex;align-items:baseline;gap:9px;min-width:0}
+.mark{color:var(--cyan);font-size:15px;text-shadow:0 0 12px rgba(62,224,255,.7)}
+.ttl{font-size:13px;letter-spacing:.22em;color:#dff4fb}
+.sub{font-size:10px;color:var(--dim);letter-spacing:.08em}
+.hud-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.chip{font-size:11px;letter-spacing:.06em;color:#7fa2b3;border:1px solid var(--line);
+  padding:3px 8px;background:rgba(62,200,230,.03)}
+.chip b{color:#bfeefb;font-weight:400}
+.chip.live{display:flex;align-items:center;gap:5px;color:#9fe9c6;border-color:rgba(47,224,138,.3)}
+.chip.live i{width:5px;height:5px;background:var(--ok);border-radius:50%;box-shadow:0 0 8px var(--ok);
+  animation:blink 1.6s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+
+.layout{
+  flex:1;min-height:0;position:relative;padding:0;overflow:hidden;
+  /* ★ 2026-10-31 v8：面板改为绝对定位 + JS 网格引擎（可拖拽/可缩放/自动贴边）。
+     布局坐标以 12 列 × 24 行的虚拟网格描述，见脚本第 7 节 LAY。
+     ★ v9：加尺寸上限（--stage-w/h，由脚本按"首次打开时的窗口尺寸"记录），
+     窗口再大也不放大；窗口变小则按比例压缩，body overflow:hidden 保证无滚动条。 */
+  width:100%;
+  max-width:var(--stage-w,100vw);
+  max-height:var(--stage-h,calc(100vh - 44px));
+  margin:0 auto;
+}
+.panel{
+  position:absolute;min-width:0;min-height:0;overflow:hidden;
+  border:1px solid var(--line);
+  background:linear-gradient(180deg,var(--panel-a),var(--panel-b));
+  display:flex;flex-direction:column;
+  box-shadow:inset 0 0 60px rgba(12,60,80,.18),0 0 0 1px rgba(0,0,0,.4);
+  transition:left .18s cubic-bezier(.2,.8,.2,1),top .18s cubic-bezier(.2,.8,.2,1),
+             width .18s cubic-bezier(.2,.8,.2,1),height .18s cubic-bezier(.2,.8,.2,1);
+}
+.panel.dragging{transition:none;z-index:60;box-shadow:0 0 0 1px rgba(62,224,255,.65),0 12px 34px rgba(0,0,0,.6),inset 0 0 60px rgba(12,60,80,.18)}
+.panel.dropping{transition:left .18s cubic-bezier(.2,.8,.2,1),top .18s cubic-bezier(.2,.8,.2,1),width .18s,height .18s}
+body.lay-edit .panel{outline:1px dashed rgba(62,224,255,.22);outline-offset:-3px}
+body.lay-edit .panel .ph{cursor:move}
+body.lay-edit .panel .ph:hover{background:rgba(62,224,255,.07)}
+.layhandle{position:absolute;right:0;bottom:0;width:16px;height:16px;display:none;z-index:5;
+  cursor:nwse-resize;background:
+    linear-gradient(135deg,transparent 46%,rgba(62,224,255,.55) 46% 54%,transparent 54%),
+    linear-gradient(135deg,transparent 66%,rgba(62,224,255,.35) 66% 74%,transparent 74%)}
+body.lay-edit .layhandle{display:block}
+/* ★ v15.5：.layouts 按钮组样式随顶栏控件一并删除 */
+.layhint{position:absolute;left:50%;bottom:6px;transform:translateX(-50%);z-index:70;
+  font-size:11px;letter-spacing:.14em;color:#02141a;background:rgba(62,224,255,.9);
+  padding:3px 10px;pointer-events:none;opacity:0;transition:opacity .2s}
+.layhint.show{opacity:1}
+.panel::before,.panel::after{content:"";position:absolute;width:9px;height:9px;border:1px solid var(--cyan);opacity:.6;pointer-events:none}
+.panel::before{left:-1px;top:-1px;border-right:0;border-bottom:0}
+.panel::after{right:-1px;bottom:-1px;border-left:0;border-top:0}
+.ph{
+  flex:0 0 auto;height:28px;display:flex;align-items:center;gap:8px;padding:0 10px;
+  border-bottom:1px solid var(--line-soft);font-size:11.5px;letter-spacing:.14em;color:#8edcf0;
+}
+.ph b{background:var(--cyan);color:#02141a;font-weight:700;padding:0 5px;font-size:10.5px;line-height:15px}
+.ph .fill{flex:1;height:1px;background:repeating-linear-gradient(90deg,rgba(62,224,255,.26) 0 2px,transparent 2px 6px)}
+.ph .meta{color:#6d93a5;letter-spacing:.1em}
+.pbody{flex:1;min-height:0;display:flex;flex-direction:column}
+
+/* ---------- 左上：状态条 ---------- */
+.statusbar{display:flex;align-items:center;gap:0;padding:6px 9px;border-bottom:1px solid var(--line-soft)}
+.sb{display:flex;align-items:center;gap:6px;padding:0 10px;border-right:1px solid var(--line-soft)}
+.sb:first-child{padding-left:0}
+.sb:last-child{border-right:0}
+.sb .lab{font-size:10.5px;color:#6d93a5;letter-spacing:.1em}
+.sb .val{font-size:14px;color:#e8f7fd;letter-spacing:.04em}
+.sb .val.ok{color:var(--ok)}
+.sb .val.bad{color:var(--warn)}
+.lamp{width:7px;height:7px;border-radius:50%;background:#2a3a44;box-shadow:0 0 0 2px rgba(255,255,255,.03)}
+.lamp.on{background:var(--warn);box-shadow:0 0 10px var(--warn);animation:blink 1.1s infinite}
+
+/* ---------- KPI ---------- */
+.kpis{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line-soft);
+  border-bottom:1px solid var(--line-soft)}
+.kpi{background:rgba(6,11,15,.9);padding:8px 10px 7px;position:relative;overflow:hidden}
+.kpi::before{content:"";position:absolute;left:0;top:0;width:1px;height:100%;
+  background:linear-gradient(180deg,var(--cyan),transparent);opacity:.55}
+.klab{font-size:11px;color:#7fa2b3;letter-spacing:.09em;display:flex;justify-content:space-between}
+.klab em{font-style:normal;color:#54798a;letter-spacing:.08em}
+.kval{font-size:26px;color:#f0fbff;letter-spacing:.02em;line-height:1.2;margin-top:3px;
+  font-variant-numeric:tabular-nums;text-shadow:0 0 16px rgba(62,224,255,.32)}
+.kval .unit{font-size:12px;color:#7fa2b3;margin-left:4px;text-shadow:none}
+.kval.sm{font-size:17px;padding-top:6px}
+.kval.warn{color:var(--warn);text-shadow:0 0 16px rgba(255,107,53,.4)}
+.kbar{height:2px;background:rgba(62,200,230,.1);margin-top:6px;position:relative}
+.kbar i{position:absolute;left:0;top:0;height:100%;width:20%;background:var(--cyan);
+  box-shadow:0 0 8px var(--cyan);transition:width .5s ease,background .3s}
+.tag{display:inline-block;margin-top:5px;font-size:10.5px;letter-spacing:.1em;padding:1px 6px;
+  border:1px solid rgba(47,224,138,.35);color:var(--ok)}
+.tag.bad{border-color:rgba(255,107,53,.5);color:var(--warn)}
+
+/* ---------- 小图 ---------- */
+.mini{height:88px;position:relative;padding:6px 8px 2px;border-bottom:1px solid var(--line-soft)}
+.mini canvas{display:block;width:100%;height:100%}
+.mini .cap{position:absolute;right:10px;top:5px;font-size:10.5px;color:#5b7a8c;letter-spacing:.06em}
+
+/* ---------- 卫星表 ---------- */
+.tblwrap{flex:1;min-height:0;overflow:auto;padding:0 2px 2px}
+table.sat{width:100%;border-collapse:collapse;font-size:12.5px}
+table.sat th{
+  position:sticky;top:0;background:#070c11;text-align:right;font-weight:400;
+  color:#6d93a5;font-size:10.5px;letter-spacing:.1em;padding:5px 7px;
+  border-bottom:1px solid var(--line-soft);z-index:2;
+}
+table.sat th:first-child{text-align:left}
+table.sat td{padding:4px 7px;text-align:right;color:#b6cbD8;font-variant-numeric:tabular-nums;
+  border-bottom:1px solid rgba(62,200,230,.035)}
+table.sat td:first-child{text-align:left;color:#e2f4fb}
+table.sat tr:hover td{background:rgba(62,200,230,.05)}
+.dot{display:inline-block;width:5px;height:5px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.st{font-size:10.5px;letter-spacing:.06em}
+.st.good{color:var(--ok)}
+.st.bad{color:var(--warn)}
+.snrbar{display:inline-block;width:34px;height:3px;background:rgba(62,200,230,.13);vertical-align:1px;margin-right:6px}
+.snrbar i{display:block;height:100%;background:var(--cyan)}
+.snrbar i.low{background:var(--warn)}
+
+/* ---------- 中间天球 ---------- */
+.core{position:relative}
+.corebody{flex:1;min-height:0;position:relative;overflow:hidden}
+#sphere{position:absolute;inset:0;width:100%;height:100%;display:block;
+  /* 原先由 canvas 每帧画一次全幅径向渐变；挪到这里由合成器缓存，省掉每帧 150 万像素的插值 */
+  background:radial-gradient(circle at 50% 48%,rgba(16,74,96,.20) 0%,rgba(8,32,44,.08) 75%,rgba(0,0,0,0) 100%)}
+/* 极光帘幕：每星一条 C/N0 光带，挂在天空球下方当地平线 */
+.aurorow{flex:0 0 104px;position:relative;border-top:1px solid var(--line-soft);
+  background:linear-gradient(180deg,rgba(4,10,14,.25),rgba(3,7,10,.85))}
+.aurorow canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.aurorow .alab{position:absolute;left:8px;top:4px;z-index:2;pointer-events:none;
+  font-size:8.5px;letter-spacing:.16em;color:#3f5c6b}
+.aurorow .amed{position:absolute;right:9px;top:4px;z-index:2;pointer-events:none;
+  font-size:8.5px;letter-spacing:.1em;color:#4e7085}
+.aurorow .amed b{color:#9fe9f5;font-weight:400}
+.ov{position:absolute;font-size:9px;letter-spacing:.12em;color:#4e7085;line-height:1.7;pointer-events:none}
+.ov b{color:#a8e4f5;font-weight:400}
+.ov.tl{left:11px;top:9px}
+.ov.tr{right:11px;top:9px;text-align:right}
+.legend{position:absolute;left:0;right:0;bottom:7px;display:flex;justify-content:center;gap:16px;
+  font-size:11px;letter-spacing:.06em;color:#7fa2b3;pointer-events:none}
+.legend span{display:flex;align-items:center;gap:5px}
+.legend i{width:6px;height:6px;border-radius:50%}
+.legend .off{opacity:.30}
+.legend .note{color:#3b5665;font-size:8.5px}
+
+/* ---------- 右侧：日志 + 统计 ---------- */
+.logbox{flex:1;min-height:0;overflow:auto;padding:4px 0}
+.logrow{display:grid;grid-template-columns:56px 68px 1fr;gap:6px;padding:4px 9px;
+  font-size:12px;line-height:1.45;border-left:2px solid transparent;animation:slidein .4s ease}
+@keyframes slidein{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+.logrow .t{color:#5b7a8c}
+.logrow .k{font-size:10px;letter-spacing:.06em;color:#8edcf0;border:1px solid rgba(62,200,230,.25);
+  padding:0 3px;text-align:center;height:16px;line-height:15px}
+.logrow .m{color:#b9cdd9}
+.logrow.alarm{border-left-color:var(--warn);background:rgba(255,107,53,.07)}
+.logrow.empty{grid-template-columns:20px 1fr;color:#44606f;justify-items:start;opacity:.75}
+.logrow.empty .m{color:#4e7085}
+.logrow.alarm .k{color:var(--warn-2);border-color:rgba(255,107,53,.45)}
+.logrow.alarm .m{color:#ffc7ad}
+.logrow.warn{border-left-color:rgba(245,197,66,.6)}
+.logrow.warn .k{color:var(--amber);border-color:rgba(245,197,66,.35)}
+.stats{flex:0 0 auto;border-top:1px solid var(--line-soft);padding:5px 9px 3px;display:flex;flex-direction:column;gap:4px}
+.statrow{display:grid;grid-template-columns:1fr 1fr;gap:8px;height:96px}
+.statcell{position:relative;min-width:0;height:96px;display:flex;flex-direction:column}
+.statcell .cl{flex:0 0 auto;font-size:10.5px;color:#6d93a5;letter-spacing:.08em;margin-bottom:5px}
+.statcell canvas{flex:1;min-height:0;width:100%;display:block}   /* ★ v15.5：弹性高度，标题换行不再顶爆格子 */
+.statcell canvas{display:block;width:100%;height:74px}
+
+/* ---------- 底部图 ---------- */
+.chartwrap{flex:1;min-height:0;position:relative;padding:6px 10px 4px}
+.chartwrap.slim{flex:.8}
+.ppsgauge{flex:1.5;min-height:0;position:relative}
+.ppsgauge canvas{display:block;width:100%;height:100%}
+/* 05 位置偏移：三种可视化（靶环 / 标尺 / 热条），头部小开关切换 */
+.offbody{flex:1;min-height:0;position:relative;padding:2px 4px 4px}
+.offbody canvas{display:block;width:100%;height:100%}
+.offseg{display:flex;gap:1px;flex-shrink:0}   /* ★ v15.5：标题栏空间不足时不得被压缩（否则按钮逐字竖排） */
+.offseg button{font:inherit;font-size:10px;letter-spacing:.08em;color:#6d93a5;background:none;
+  border:1px solid rgba(62,200,230,.16);padding:1px 6px;cursor:pointer;white-space:nowrap}
+.offseg button:hover{color:#dff4fb}
+.offseg button.on{color:#02141a;background:#3ee0ff;border-color:#3ee0ff}
+.chartwrap canvas{display:block;width:100%;height:100%}
+.footnote{position:absolute;right:12px;top:8px;font-size:10.5px;color:#5b7a8c;letter-spacing:.06em}
+.footnote b{color:#a3d5e6;font-weight:400}
+
+/* ---------- 视图切换（★ v5 起单页，页签已删；[hidden] 规则保留防旧缓存）---------- */
+[hidden]{display:none !important}
+.algwrap{flex:1;min-height:0;position:relative;padding:9px 12px 2px}
+.algwrap canvas{display:block;width:100%;height:100%}
+.legrow{display:flex;flex-wrap:wrap;align-items:center;gap:14px;
+  padding:2px 14px 9px;font-size:10.5px;letter-spacing:.08em;color:#7fa2b3}
+.legrow span{display:flex;align-items:center;gap:5px}
+.legrow i{width:9px;height:9px;display:block}
+/* 窄面板（总览底行 0.76fr）用紧凑版图例，一行塞得下 */
+.legrow.compact{gap:9px;padding:2px 8px 6px;font-size:10px;letter-spacing:.04em;white-space:nowrap}
+.legrow.compact i{width:7px;height:7px}
+.algpad{flex:1;min-height:0;padding:7px 16px 5px;display:flex;flex-direction:column;gap:5px}
+
+/* 卡内小标题行 */
+.rowhead{display:flex;align-items:baseline;justify-content:space-between;
+  font-size:11.5px;letter-spacing:.12em;color:#8edcf0}
+.rowhead .sub2{color:#6d93a5;letter-spacing:.08em}
+.amber{color:var(--amber)}
+.green{color:var(--ok)}
+.orange{color:var(--warn)}
+
+/* INTEGRITY：横条量程 0..2*AL，AL 落在正中 */
+.hbar{position:relative;height:12px;background:rgba(62,200,230,.09);
+  border:1px solid var(--line-soft);overflow:visible}
+.hbar i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--cyan);
+  box-shadow:0 0 12px rgba(62,224,255,.55);
+  transition:width .7s cubic-bezier(.4,0,.2,1),background .3s,box-shadow .3s}
+.hbar i.bad{background:var(--warn);box-shadow:0 0 16px rgba(255,107,53,.7)}
+/* ★ v14:HPL 条分级 —— 0.5~1×AL 琥珀("在逼近"),与板上 INTEGRITY 条同一套语言 */
+.hbar i.warn{background:#f5c542;box-shadow:0 0 12px rgba(245,197,66,.55)}
+.hbar .altick{position:absolute;left:50%;top:-5px;bottom:-5px;width:1px;background:var(--warn);opacity:.85}
+.hbar .alcap{position:absolute;left:50%;top:-18px;transform:translateX(-50%);
+  font-size:10px;letter-spacing:.08em;color:var(--warn);opacity:.9;white-space:nowrap}
+
+.bigrow{display:flex;gap:26px;font-size:19px;letter-spacing:.03em;color:#eaf8fe}
+.bigrow b{font-weight:400}
+.bigrow2{display:flex;gap:26px;font-size:14.5px;letter-spacing:.03em;color:#aecdde}
+.statebig{font-size:24px;letter-spacing:.12em;color:var(--ok);line-height:1.1;
+  text-shadow:0 0 20px rgba(47,224,138,.35);transition:color .3s,text-shadow .3s}
+.statebig.bad{color:var(--warn);text-shadow:0 0 20px rgba(255,107,53,.5)}
+.statebig.warn{color:var(--amber);text-shadow:0 0 20px rgba(245,197,66,.45)}
+.subrow{font-size:12px;color:#7fa2b3;letter-spacing:.05em;line-height:1.5}
+
+/* DETECTORS：六格读数 */
+.detgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);
+  border:1px solid var(--line-soft);margin-top:auto}
+.detgrid>div{background:rgba(6,12,17,.85);padding:5px 9px;display:flex;flex-direction:column;gap:2px}
+.detgrid .dl{font-size:10.5px;letter-spacing:.08em;color:#6d93a5}
+.detgrid .dl em{font-style:normal;color:#44606f;font-size:9px;letter-spacing:.04em}
+.detgrid b{font-weight:400;font-size:14px;color:#e0f1f9;letter-spacing:.02em}
+/* ★ v1.14.9 CUSUM 宽格:占 2 列,累积条 + 迷你趋势 */
+.detgrid .cusumcell{grid-column:span 2}
+.cusumcell .cbar{height:5px;background:rgba(62,200,230,.12);margin:3px 0;position:relative;overflow:hidden}
+.cusumcell .cbar i{position:absolute;left:0;top:0;bottom:0;width:0;
+  background:var(--cyan);box-shadow:0 0 6px rgba(62,224,255,.5);transition:width .6s,background .4s}
+.cusumcell .crow{display:flex;align-items:flex-end;gap:8px;flex:1;min-height:0}
+.cusumcell .crow b{white-space:nowrap}
+.cusumcell .crow canvas{flex:1;height:24px;min-width:0}
+
+/* ---------- 08 C/N0 声化（★ v13）----------
+   把"信号质量"变成可听的东西：C/N0 → 音高，单声部，量化 + 迟滞防跳音。
+   可视化作成面板内的音高带 + 24 s 走向；可调参数收进 ⚙ 浮层，
+   面板本身保持一条窄卡，不抢天球的位置。 */
+.ph .sonbtn{
+  font:inherit;font-size:11px;line-height:15px;color:#8edcf0;flex-shrink:0;white-space:nowrap;
+  background:rgba(62,200,230,.06);border:1px solid rgba(62,200,230,.22);
+  padding:0 5px;margin-left:4px;cursor:pointer;letter-spacing:0;
+}
+.ph .sonbtn:hover{background:rgba(62,224,255,.14)}
+.ph .sonbtn.on{background:var(--cyan);color:#02141a;border-color:var(--cyan);box-shadow:0 0 10px rgba(62,224,255,.45)}
+.sonbody{position:relative;gap:0}
+/* ★ v15.6：合唱模式读数行多出「声部数 / 摆幅」，窄面板必须裁切而不是把行撑开 */
+.sonread{display:flex;align-items:baseline;gap:6px;padding:4px 9px 2px;flex:0 0 auto;
+  overflow:hidden;white-space:nowrap}
+.sonread .snote.ch{font-size:13px;color:var(--cyan);letter-spacing:.02em}
+.sonread .ssolf.ch{color:#4e7085;letter-spacing:.14em}
+.sonread .scn{font-size:19px;color:#eaf8fe;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.sonread .sunit{font-size:9.5px;color:#6d93a5}
+.sonread .snote{margin-left:auto;font-size:15px;color:var(--ok);letter-spacing:.04em}
+.sonread .ssolf{font-size:10px;color:#6d93a5}
+.sonread .sfreq{font-size:9.5px;color:#54798a;font-variant-numeric:tabular-nums}
+.sonband{flex:0 0 54px;position:relative;min-height:0}
+.sonroll{flex:1 1 auto;position:relative;min-height:0}
+.sonband canvas,.sonroll canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.sonroll .scap{position:absolute;right:6px;top:2px;font-size:8.5px;letter-spacing:.12em;color:#3f5c6b;pointer-events:none}
+.sonhint{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  font-size:10.5px;letter-spacing:.08em;color:#54798a;background:rgba(4,9,13,.55);pointer-events:none}
+.sonbody.nodata .sonhint{display:flex}
+
+/* 设置浮层：挂 body 上，position:fixed —— 不受面板 overflow:hidden 裁切 */
+.soncfg{position:fixed;z-index:220;width:356px;padding:9px 12px 9px;max-height:calc(100vh - 24px);overflow-y:auto;
+  background:linear-gradient(180deg,rgba(12,22,30,.99),rgba(6,11,16,.99));
+  border:1px solid rgba(96,196,222,.28);box-shadow:0 18px 44px rgba(0,0,0,.66),inset 0 0 40px rgba(12,60,80,.16);
+  font-size:11px;color:var(--text)}
+.soncfg[hidden]{display:none}
+.soncfg .hd{display:flex;align-items:center;gap:8px;font-size:10.5px;letter-spacing:.16em;color:#8edcf0;
+  padding-bottom:7px;border-bottom:1px solid var(--line-soft);margin-bottom:2px}
+.soncfg .hd .x{margin-left:auto;cursor:pointer;color:#6d93a5;font-size:13px;line-height:1}
+.soncfg .hd .x:hover{color:#dff4fb}
+.soncfg .cols{display:grid;grid-template-columns:1fr 1fr;gap:0 16px;align-items:start}
+.soncfg .grp{margin-top:6px}
+.soncfg .k{font-size:9.5px;letter-spacing:.12em;color:#54798a;display:block;margin-bottom:2px}
+.soncfg .seg{display:flex;gap:3px}
+.soncfg .seg button{flex:1;font:inherit;font-size:10.5px;padding:3px 0;cursor:pointer;white-space:nowrap;
+  color:#7fa2b3;background:rgba(62,200,230,.04);border:1px solid rgba(62,200,230,.16)}
+.soncfg .seg button:hover{color:#dff4fb;background:rgba(62,224,255,.1)}
+.soncfg .seg button.on{color:#02141a;background:var(--cyan);border-color:var(--cyan)}
+.soncfg .row{display:flex;align-items:center;gap:8px;margin-top:4px}
+.soncfg .row .lb{flex:0 0 58px;font-size:10.5px;color:#7fa2b3}
+.soncfg .row .vv{flex:0 0 42px;text-align:right;font-size:10px;color:#54798a;font-variant-numeric:tabular-nums}
+.soncfg input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:3px;outline:none;
+  background:linear-gradient(90deg,rgba(62,200,230,.22),rgba(62,200,230,.34))}
+.soncfg input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;
+  background:var(--cyan);border:2px solid #071018;box-shadow:0 0 0 1px rgba(62,224,255,.45);cursor:pointer}
+.soncfg .ft{margin-top:8px;padding-top:6px;border-top:1px solid var(--line-soft);
+  font-size:9.5px;line-height:1.6;color:#54798a;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.soncfg .ft b{color:#7fa2b3;font-weight:400}
+.soncfg .ft a{color:#8edcf0;text-decoration:none;border-bottom:1px dotted rgba(142,220,240,.4)}
+.soncfg .hint{font-size:10.5px;line-height:1.75;color:#7fa2b3}
+.soncfg .hint b{color:#8edcf0;font-weight:400}
+/* ★ v15.6：按唱法分组显示 —— 合唱是"音高=仰角 / 亮度=C/N0 / 音量=偏离中位"，
+/* v16：唱法分类显隐规则删除（只剩一种唱法） */
+
+/* 数值变化时闪一下，让"数据在流"看得见 */
+/* ★ v14：数值闪动改由 Web Animations 驱动（见 setNum），这里只留一个可降级的淡入。
+   旧写法 `text-shadow:0 0 16px` 每帧都要重算一次高斯模糊，且每 2 s 被 setNum
+   触发 4 次 —— 全页重绘的另一个来源。现在只动 color，不碰阴影。 */
+@keyframes valflash{from{color:#fff}to{color:inherit}}
+
+/* 空数据占位 */
+.emptyhint{display:flex;align-items:center;justify-content:center;height:100%;
+  font-size:13px;letter-spacing:.06em;color:#5b7a8c}
+
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(62,224,255,.2)}
+::-webkit-scrollbar-thumb:hover{background:rgba(62,224,255,.35)}
+</style>
+</head>
+<body>
+<div class="bg-static"></div>
+<div class="bg-sweep"></div>
+
+<div class="app">
+  <header class="hud">
+    <div class="brand">
+      <span class="mark">◈</span>
+      <span class="ttl">GNSS SIGNAL INTEGRITY</span>
+      <span class="sub">/ PPS 授时 · 欺骗感知 · 位置漂移监测</span>
+    </div>
+    <div class="hud-right">
+      <!-- ★ v15.5：布局预设/编辑/重置按钮组删除 —— 版式固定为当前存档，不再提供页上切换 -->
+      <span class="chip">NODE <b>SH-ROOF-01</b></span>
+      <span class="chip" id="chipLink">W1 · UDP <b>9911</b></span>
+      <span class="chip live"><i></i>LIVE</span>
+    </div>
+  </header>
+
+  <div class="layout" id="layoutOv">
+    <div class="layhint">编辑模式：拖标题栏移动 · 拖右下角缩放</div>
+
+    <!-- ============ 01 左上：实时指标 ============ -->
+    <section class="panel" data-p="01">
+      <div class="ph"><b>01</b> 实时指标<span class="fill"></span><span class="meta">REAL-TIME</span></div>
+      <div class="pbody">
+        <div class="statusbar">
+          <div class="sb"><span class="lab">UTC</span><span class="val" id="utc">--:--:--</span></div>
+          <div class="sb"><span class="lab">LINK</span><span class="val ok" id="link">ONLINE</span></div>
+          <div class="sb"><span class="lab">ALARM</span><span class="lamp" id="lamp"></span><span class="val" id="alarmText">NOMINAL</span></div>
+        </div>
+
+        <div class="kpis">
+          <!-- ★ 2026-10-31：SQW−PPS 相位 KPI 删除 —— 04 已有脉冲对比带，
+               同一信息不在两处显示（去重结论）。 -->
+          <div class="kpi">
+            <div class="klab"><span>有效卫星</span><em>USED</em></div>
+            <div class="kval" id="kSat">0<span class="unit">sv</span></div>
+            <div class="kbar"><i id="satBar" style="width:60%"></i></div>
+          </div>
+          <div class="kpi">
+            <div class="klab"><span>定位模式</span><em>FIX</em></div>
+            <div class="kval sm" id="kFix">3D FIX</div>
+          </div>
+          <div class="kpi">
+            <div class="klab"><span>位置偏移</span><em>OFFSET</em></div>
+            <div class="kval" id="kOff">0.0<span class="unit">m</span></div>
+            <div class="tag" id="offTag">NOMINAL</div>
+          </div>
+          <div class="kpi">
+            <div class="klab"><span>在视卫星</span><em>TRACKED</em></div>
+            <div class="kval sm" id="ovTracked">0</div>
+          </div>
+          <div class="kpi">
+            <div class="klab"><span>HDOP</span><em>DOP</em></div>
+            <div class="kval" id="ovHdop">--</div>
+          </div>
+          <div class="kpi">
+            <div class="klab"><span>C/N0 中位</span><em>dB-Hz</em></div>
+            <div class="kval" id="aurMed">--</div>
+          </div>
+        </div>
+
+        <!-- ★ v1.14.9:mini 图(48 拍)删除 —— 与 04 双联表的拖尾/3H 条重复,去重结论 -->
+
+        <div class="tblwrap">
+          <table class="sat">
+            <thead><tr><th>PRN</th><th>SNR</th><th>EL</th><th>AZ</th><th>ST</th></tr></thead>
+            <tbody id="satBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 02 中间：天球星图 ============ -->
+    <section class="panel core" data-p="02">
+      <div class="ph"><b>02</b> 天球星图<span class="fill"></span><span class="meta">AZIMUTHAL DOME · AZ 方位 / EL 仰角</span></div>
+      <div class="corebody">
+        <canvas id="sphere"></canvas>
+        <div class="legend" id="legend"></div>
+      </div>
+      <!-- ★ 2026-10-31：①底部 C/N0 帘幕移入天球两侧（左 GPS / 右 BDS），aurorow 移除；
+           ②原左上/右上浮动读数(PROJ/CLOCK/MED/TRACKED/USED/HDOP)与光幕重叠，
+              TRACKED/HDOP/MED 移入 01 面板 KPI，USED 与 01 的"有效卫星"重复故删除；
+           ③aurMed 更新逻辑(原1542行)不变，id 未改 -->
+    </section>
+
+    <!-- ============ 03 右上：日志与统计 ============ -->
+    <section class="panel" data-p="03">
+      <div class="ph"><b>03</b> 告警与统计<span class="fill"></span><span class="meta">EVENT LOG</span></div>
+      <div class="pbody">
+        <div class="logbox" id="log"></div>
+        <div class="stats">
+          <div class="statrow">
+            <div class="statcell">
+              <div class="cl">告警频次 / 12H</div>
+              <canvas id="chAlarmBar"></canvas>
+            </div>
+            <div class="statcell">
+              <div class="cl">信号质量分布 / SNR</div>
+              <canvas id="chSnrBar"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 04 左下：SQW−PPS 脉冲对比带（★ 2026-10-31 改版）============
+         每个 1PPS 拍画一对脉冲：上带=GNSS PPS（金），下带=DS3231 SQW（青）。
+         两带之间留固定"层隔"，横向错位就是相位差 —— 谁在前谁在后一眼可辨；
+         带间斜连线把同一拍的两个脉冲绑在一起。绝对值无意义，频差（斜率）才有
+         信息，所以只留一行数字读数，不再画相位历史/回归半圆表。 -->
+    <section class="panel" data-p="04">
+      <div class="ph"><b>04</b> SQW−PPS 脉冲对比<span class="fill"></span><span class="meta" id="ppsMeta">PPS ▲ / SQW ▼ · Δ ms</span></div>
+      <div class="ppsgauge"><canvas id="chPpsG"></canvas></div>
+    </section>
+
+    <!-- ============ 05 位置偏移（三种可视化可切，★ v8）============
+         只有标量"偏移距离"，没有方位角，所以不画假的东北散点。
+         三种诚实画法：靶环表（当前指针+3H包络）/ 标尺条（分区+须线）/ 热条（何时偏）。 -->
+    <section class="panel" data-p="05">
+      <div class="ph"><b>05</b> 位置偏移<span class="fill"></span>
+        <span class="offseg" id="offSeg">
+          <button data-v="ring">靶环</button><button data-v="ruler">标尺</button><button data-v="heat">热条</button>
+        </span>
+      </div>
+      <div class="offbody"><canvas id="chOff"></canvas></div>
+    </section>
+
+    <!-- ============ 06 底行：C/N0 中位趋势（★ v4 自算法页②整体迁入）============ -->
+    <section class="panel" data-p="06">
+      <div class="ph"><b>06</b> C/N0 中位趋势<span class="fill"></span><span class="meta">GPS / BDS · 120 拍</span></div>
+      <div class="pbody">
+        <div class="algwrap"><canvas id="chTrd"></canvas></div>
+        <div class="legrow compact">
+          <span><i style="background:#f5c542"></i>GPS</span>
+          <span><i style="background:#2f9bff"></i>BDS</span>
+          <span><i style="background:#ff6b35"></i>25 阈值</span>
+          <span><i style="background:rgba(62,200,230,.35)"></i>40 参考</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 07 右下：完好性 · 检测器（★ v4 自算法页③④合并迁入）============ -->
+    <section class="panel" data-p="07">
+      <div class="ph"><b>07</b> 完好性 · 检测器<span class="fill"></span><span class="meta">HPL</span></div>
+      <div class="pbody algpad">
+        <div class="rowhead"><span>HPL vs AL</span><span class="sub2" id="alTxt">AL 30 m</span></div>
+        <div class="hbar"><span class="alcap">AL</span><i id="hplFill"></i><span class="altick"></span></div>
+        <div class="bigrow"><b id="hplTxt">HPL ---</b></div>
+        <div class="bigrow2"><b id="offTxt">OFF ---</b><b id="limTxt">LIM 30 m</b></div>
+        <div class="statebig" id="stateBig" style="font-size:17px">---</div>
+        <div class="subrow" id="dopTxt">HDOP -- · VDOP -- · σ --</div>
+        <div class="detgrid">
+          <div><span class="dl">多径 MP</span><b id="mpTxt">MP none</b></div>
+          <!-- ★ v1.14.9:CUSUM 上屏(固件 STA 包尾插列)。慢变量 —— 单拍看不出,
+               累积条一格一格涨,过 20.0 m·s 且过绝对闸(硬件 v1.14.10 起 15 m)判"慢漂移"染红。 -->
+          <div class="cusumcell">
+            <span class="dl">CUSUM 慢漂移 <em>/ 20.0 m·s</em></span>
+            <div class="cbar"><i id="cusumBar"></i></div>
+            <div class="crow"><b id="cusumTxt">--</b><canvas id="chCusum"></canvas></div>
+          </div>
+          <div><span class="dl">温度</span><b id="tempTxt">--</b></div>
+          <div><span class="dl">湿度</span><b id="rhTxt">--</b></div>
+          <div><span class="dl">时间源</span><b id="tsrcTxt">--</b></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 08 C/N0 声化（★ v13）============
+         同一路 C/N0，两种读法：06 看慢趋势，08 听当下音高。
+         单声部（中位/最强/最弱可切）→ 量化到音阶 → 迟滞换音，
+         所以数值 ±0.5 dB 的抖动不会变成音高乱跳。
+         可调参数收在标题栏 ⚙ 里（浮层），面板本身只留 音高带 + 24 s 走向。 -->
+    <section class="panel" data-p="08">
+      <div class="ph"><b>08</b> C/N0 声化<span class="fill"></span>
+        <!-- ★ v15.5：sonMeta（SINGLE VOICE/AUDIBLE）删除 —— 与 ♪ 按钮状态重复，窄面板会挤压换行 -->
+        <button class="sonbtn" id="sonPower" title="开始 / 停止发声">♪ 静音</button>
+        <button class="sonbtn" id="sonGear" title="声化设置">⚙</button>
+      </div>
+      <div class="pbody sonbody nodata" id="sonBody">
+        <div class="sonread">
+          <span class="scn" id="sonCn">--</span><span class="sunit" id="sonUnit">dB-Hz</span>
+          <span class="snote" id="sonNote">--</span>
+          <span class="ssolf" id="sonSolf"></span>
+          <span class="sfreq" id="sonFreq"></span>
+        </div>
+        <div class="sonband"><canvas id="chSonKeys"></canvas></div>
+        <div class="sonroll"><canvas id="chSonRoll"></canvas><span class="scap">24 s</span></div>
+        <div class="sonhint">等 C/N0 数据…</div>
+      </div>
+    </section>
+
+  </div>
+
+</div>
+
+<!-- 08 设置浮层（挂 body，避免被面板裁切）。★ v16 简化：在 01 面板点卫星发声，
+     浮层只剩 音阶 + 音量 —— 平滑/换音门槛/滑音对听感帮助有限，全部移除；
+     合唱（自动选星）听久不舒服，删除。 -->
+<div class="soncfg" id="sonCfg" hidden>
+  <div class="hd">C/N0 声化设置<span class="x" id="sonCfgX">✕</span></div>
+  <div class="cols">
+    <div>
+      <div class="grp"><span class="k">音阶</span>
+        <div class="seg" data-k="scale">
+          <button data-v="pent">五声</button><button data-v="major">大调七声</button><button data-v="whole">全音</button>
+        </div>
+      </div>
+      <div class="grp"><span class="k">音色</span>
+        <div class="seg" data-k="timbre">
+          <button data-v="bell">钟</button><button data-v="glass">玻璃</button><button data-v="wood">木</button>
+        </div>
+      </div>
+      <div class="grp"><span class="k">音量</span>
+        <div class="row"><input id="sVol" type="range" min="0" max="100" value="45"><span class="vv" id="vVol">45%</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="grp"><span class="k">怎么发声</span>
+        <div class="hint">到 <b>02 天球星图</b> 上直接点卫星：<br>
+          点哪颗，哪颗的 C/N0 就接管；<br>
+          它的音一变就<b>敲一下</b>，不拖长音；<br>
+          点多颗就是多个声部轮流敲。<br>
+          音高 = 该星 C/N0，左右 = 方位。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ft">♪ 按钮是总开关（一键全停） · 建议 1~6 颗，太多会糊</div>
+</div>
+
+<script src="chart.umd.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  /* =========================================================
+     0. 常量与工具
+  ========================================================= */
+  const PPS_LIMIT = 25;       // ppm —— 相位**斜率**告警阈值；必须大于 pdo 的量化粒度
+                              //   （0.1 ms 台阶 / 5 s 拍间隔 ≈ 20 ppm 表观斜率），10 曾瞬时误触发
+  let phasePpm = null;        // 最近 60 拍回归得到的 SQW−PPS 频差（只做判据，不上图）
+  const OFF_LIMIT = 30;      // m
+  const HIST = 260;          // 长趋势点数（约 3h @ 40s/点，演示加速）
+
+  const COL = {
+    cyan: '#48d9f0',
+    cyanFill: 'rgba(72,217,240,.13)',
+    warn: '#ff6b35',
+    warnFill: 'rgba(255,107,53,.20)',
+    grid: 'rgba(96,196,222,.07)',
+    tick: '#587485'
+  };
+
+  /* ★ v9：星座配色重排 —— 原来 GPS 暗金 #f5c542 / BDS 暗蓝 #2f9bff，
+     两色明度都低、面积又大（柱子+光晕+标签），久看发闷。
+     改法：①色相拉开到青绿↔珊瑚（约 150°），明度提到 65~70%；
+           ②星点核心一律近白，颜色只留在光晕/柱体/标签上，减少大面积色块。 */
+  const SYS = {
+    GPS: { label: 'GPS', color: '#5fe3c0', p: 'G' },
+    BDS: { label: 'BDS', color: '#ffae7b', p: 'C' },
+    GAL: { label: 'GALILEO', color: '#b9a8ff', p: 'E' },
+    GLO: { label: 'GLONASS', color: '#ff9aa8', p: 'R' }
+  };
+
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const pad2 = n => String(n).padStart(2, '0');
+
+  /* =========================================================
+     1. 数据模型（★ 正式版：全部来自 S3 推流，页面不造任何数）
+     ---------------------------------------------------------
+     铁律（任务单 §3 数据映射）：
+       PPS 相位差 = OBS 第 15 列 pdo（ms；-1 = 无脉冲）
+       off        = OBS 第 9 列
+       星数/HDOP  = OBS 第 2/3 列
+       定位模式   = STA 的 qual（**不用星数/HDOP 反推**）
+       逐星/天球  = SKY
+  ========================================================= */
+  const sats = [];
+  const cusumHist = [];          // ★ v1.14.9:CUSUM 页面侧历史(120 拍 ≈ 10 min),供迷你趋势条
+  const offLong = [];
+  let alarmCounts = new Array(12).fill(0);
+  const snrBins = [0, 0, 0, 0, 0, 0];
+  let live = null;
+  let lastEvtSig = '';
+  let lastGapSum = 0;
+  const SYS_OF = { G: 'GPS', E: 'GAL', R: 'GLO', B: 'BDS' };
+
+  /* =========================================================
+     2. 图表通用配置
+  ========================================================= */
+  if (typeof Chart === 'undefined') {
+    document.body.insertAdjacentHTML('beforeend',
+      '<div style="position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:99;' +
+      'border:1px solid #ff6b35;color:#ffa07a;padding:8px 14px;font-size:11px;background:#0b0f14">' +
+      'Chart.js 未加载（离线）· 曲线区暂不可用，星空图与数据仍在运行</div>');
+  } else {
+    Chart.defaults.font.family = '"JetBrains Mono","SFMono-Regular",Consolas,monospace';
+    Chart.defaults.font.size = 9;
+    Chart.defaults.color = COL.tick;
+    Chart.defaults.animation.duration = 280;
+
+    /* 阈值超限区填充（红底） */
+    Chart.register({
+      id: 'thresholdBand',
+      afterDatasetsDraw(chart) {
+        const th = chart.$th;
+        if (th == null) return;
+        const { ctx, chartArea, scales: { y } } = chart;
+        const yth = y.getPixelForValue(th);
+        if (yth <= chartArea.top) return;
+        const pts = chart.getDatasetMeta(0).data;
+        if (!pts.length) return;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(chartArea.left, chartArea.top, chartArea.width, yth - chartArea.top);
+        ctx.clip();
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.lineTo(pts[pts.length - 1].x, chartArea.bottom);
+        ctx.lineTo(pts[0].x, chartArea.bottom);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(255,107,53,.17)';
+        ctx.fill();
+        ctx.restore();
+      }
+    });
+
+    /* 异常点位标记 */
+    Chart.register({
+      id: 'anomalyMarks',
+      afterDatasetsDraw(chart) {
+        const idxs = chart.$anom;
+        if (!idxs || !idxs.size) return;
+        const meta = chart.getDatasetMeta(0);
+        const ctx = chart.ctx;
+        ctx.save();
+        idxs.forEach(i => {
+          const p = meta.data[i];
+          if (!p) return;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(255,107,53,.75)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 1.8, 0, Math.PI * 2);
+          ctx.fillStyle = '#ff8a5b';
+          ctx.fill();
+        });
+        ctx.restore();
+      }
+    });
+  }
+
+  const baseScales = (yMax, yMin) => ({
+    x: { display: false, grid: { display: false } },
+    y: {
+      min: yMin, max: yMax, border: { display: false },
+      grid: { color: COL.grid, drawTicks: false },
+      ticks: { color: COL.tick, padding: 6, font: { size: 11 } }
+    }
+  });
+  const baseOpts = extra => Object.assign({
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 260 },
+    interaction: { intersect: false, mode: 'index' },
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    layout: { padding: { top: 4, right: 2, bottom: 0, left: 0 } }
+  }, extra || {});
+
+  const charts = {};
+
+  if (typeof Chart !== 'undefined') {
+
+    /* ---- 2.1 小趋势:PPS —— ★ v1.14.9 删除(01 mini 图退场,见 DOM 注释) ---- */
+
+    /* ---- 2.2 左下:PPS 长趋势 —— ★ 2026-10-31 删除(相位历史看不清意义,04 只留脉冲对比带) ---- */
+
+    /* ---- 2.3 位置偏移 —— ★ 2026-10-31 v8：Chart.js 折线退场，
+       改由自绘 drawOffViz() 提供靶环/标尺/热条三种画法（可切）。 ---- */
+
+    /* ---- 2.4 告警频次柱 ---- */
+    charts.alarmBar = new Chart(document.getElementById('chAlarmBar'), {
+      type: 'bar',
+      data: {
+        labels: alarmCounts.map((_, i) => i),
+        datasets: [{
+          data: alarmCounts.slice(),
+          backgroundColor: alarmCounts.map(v => (v >= 4 ? 'rgba(255,107,53,.55)' : 'rgba(62,224,255,.32)')),
+          borderWidth: 0,
+          barPercentage: 0.7,
+          categoryPercentage: 0.9
+        }]
+      },
+      options: baseOpts({
+        animation: { duration: 0 },
+        scales: {
+          x: { display: false, grid: { display: false } },
+          y: { min: 0, border: { display: false }, grid: { color: COL.grid, drawTicks: false },
+               ticks: { display: false } }
+        }
+      })
+    });
+
+    /* ---- 2.5 SNR 分布柱 ---- */
+    charts.snrBar = new Chart(document.getElementById('chSnrBar'), {
+      type: 'bar',
+      data: {
+        labels: ['<20', '20-25', '25-30', '30-35', '35-40', '>40'],
+        datasets: [{
+          data: snrBins.slice(),
+          backgroundColor: ['rgba(255,107,53,.6)', 'rgba(245,197,66,.45)',
+            'rgba(62,224,255,.35)', 'rgba(62,224,255,.45)',
+            'rgba(62,224,255,.6)', 'rgba(47,224,138,.55)'],
+          borderWidth: 0,
+          barPercentage: 0.78,
+          categoryPercentage: 0.92
+        }]
+      },
+      options: baseOpts({
+        animation: { duration: 0 },
+        scales: {
+          x: { display: false, grid: { display: false } },
+          y: { min: 0, border: { display: false }, grid: { color: COL.grid, drawTicks: false },
+               ticks: { display: false } }
+        }
+      })
+    });
+  }
+
+  /* =========================================================
+  /* =========================================================
+     3. 天球星图 v3 —— 穹顶 + 星轨长曝光 + 信号流星 + 两侧 C/N0 光幕
+        (2026-10-31 用户选定版式：真实时间流速，无加速、无自转；
+         中央穹顶只画地平线以上半球，左幕 GPS / 右幕 BDS，
+         参与解算的星从光幕那格牵正弦光带到穹顶对应星位)
+     ========================================================= */
+  const cv = document.getElementById('sphere');
+  const ctx = cv.getContext('2d');
+  let W = 1, H = 1, DPR = 1;
+  let bandCv = null, bandW = 0, bandH = 0, bandDpr = 1;   // 04 脉冲带画布（尺寸缓存，rAF 内不测量）
+  const D2R = Math.PI / 180;
+
+  let cvEpoch = 1;                       // 布局版本号：凡是面板尺寸变了就 ++（prep 的缓存钥匙）
+  function resize() {
+    cvEpoch++;
+    const r = cv.parentElement.getBoundingClientRect();
+    W = Math.max(320, r.width);
+    H = Math.max(240, r.height);
+    /* ★ 2026-10-31 卡顿治理：天球是每帧全量重绘的，像素量直接等于栅格化成本。
+       这块面板在 2K 屏上能到 1000×700 CSS 像素，DPR 1.5 就是 155 万物理像素/帧。
+       大面积画布把像素密度压到 1.25（视觉差别几乎看不出），小窗口仍走 2 倍。 */
+    const cap = (W * H > 500000) ? 1.25 : 2;
+    DPR = Math.min(window.devicePixelRatio || 1, cap);
+    cv.width = W * DPR;
+    cv.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    bandMeasure();                 // ★ 尺寸只在这里测，rAF 里不再强制布局
+  }
+  window.addEventListener('resize', resize);
+
+  /* ★ v15.4：画布尺寸竞态兜底。脚本先执行、布局后摆放，偶尔会把"摆好之前"的
+     面板尺寸量进缓存（实测：穹顶后端 992×240 vs 实际显示 483×711，天球整片空白，
+     06 趋势缺线同病根）。ResizeObserver 盯住每块画布：CSS 尺寸真变了才触发
+     重测（rAF 去抖），时序再乱都能自愈；画布只改后备存储不改 CSS 尺寸，不会自激。 */
+  if (window.ResizeObserver) {
+    const __roSz = new Map();            // canvas -> [w,h] 上次 CSS 尺寸
+    const __ro = new ResizeObserver(() => {
+      let changed = false;
+      document.querySelectorAll('canvas').forEach(c => {
+        const r = c.getBoundingClientRect();
+        const w = Math.round(r.width), h = Math.round(r.height);
+        const p = __roSz.get(c);
+        if (!p || Math.abs(w - p[0]) >= 2 || Math.abs(h - p[1]) >= 2) {
+          __roSz.set(c, [w, h]); changed = true;
+        }
+      });
+      if (changed) layRefreshSoon();
+    });
+    document.querySelectorAll('canvas').forEach(c => __ro.observe(c));
+  }
+
+  /* ★ v15 卡顿治理：hexA 每帧被调几百次，每次都要 parseInt + 拼字符串 + 生成新字符串对象
+     （实测占单核 5%）。颜色只有十几个、alpha 量化到千分之一就够用，直接查表。 */
+  const hexCache = new Map();          // hex -> Array(1001)，按 alpha 千分位直接查
+  function hexA(hex, a) {
+    const al = a < 0 ? 0 : (a > 1 ? 1 : a);
+    const q = (al * 1000) | 0;
+    let row = hexCache.get(hex);
+    if (row === undefined) { row = new Array(1001); hexCache.set(hex, row); }
+    let s = row[q];
+    if (s !== undefined) return s;
+    const n = parseInt(hex.slice(1), 16);
+    s = 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + (q / 1000) + ')';
+    row[q] = s;
+    return s;
+  }
+
+  /* ---- 版面几何：中央穹顶 + 左右光幕 ---- */
+  function geom() {
+    const curtW = Math.max(56, Math.min(118, W * 0.105));
+    /* ★ v15.5：两侧留白 44 → 24，圆盘直径 +10 px（面板窄时宽度是唯一瓶颈，
+       H 项几乎不起作用）。投影只有单一半径 R，圆恒为正圆。 */
+    const R = Math.min(H * 0.405, (W - curtW * 2 - 24) / 2);   // 0.405: 底部让位给星座图例(避开 S 标)
+    return { curtW, cx: W / 2, cy: H / 2 - 2, R };
+  }
+  function projD(az, el, g) {
+    const r = g.R * (1 - Math.min(Math.max(el, 0), 90) / 90);
+    return { x: g.cx + r * Math.sin(az * D2R), y: g.cy - r * Math.cos(az * D2R) };
+  }
+
+  /* ---- 每星持久状态：缓动位置 + 流星尾迹 + 升落事件 ---- */
+  const TRAIL_STEP = 30, TRAIL_N = 130;  // 30 s 一点 / 130 点 = 65 min 轨迹
+  let trailVer = 0;                      // 采点版本号 → 轨迹缓存失效
+  const stMap = new Map();          // prn -> {sys,az,el,snr,hist,acc,lastSeen,ph,gone}
+  const events = [];                // {prn,kind,t}  kind: rise/set/lost
+  let lastEvent = null;
+  const meteors = [];               // {prn,q,sp}
+  const BOOT = performance.now();
+
+  function updateStates(dt, now) {
+    const kA = 1 - Math.exp(-dt * 2.2), kS = 1 - Math.exp(-dt * 4);
+    for (const s of sats) {
+      let st = stMap.get(s.prn);
+      if (!st) {
+        st = { sys: s.sys, az: s.az, el: s.el, snr: s.snr, hist: [], acc: 99,
+               lastSeen: now, ph: Math.random() * 6.28, gone: false };
+        stMap.set(s.prn, st);
+        if (now - BOOT > 10000 && s.el >= 0) {            // 页面刚打开的 10 s 不刷屏
+          events.push({ prn: s.prn, kind: 'rise', t: 0 });
+          lastEvent = events[events.length - 1];
+          if (events.length > 10) events.shift();
+        }
+      }
+      let d = s.az - st.az;                               // 方位最短路径缓动(跨 0° 不打转)
+      if (d > 180) d -= 360; else if (d < -180) d += 360;
+      st.az = (st.az + d * kA + 360) % 360;
+      st.el += (s.el - st.el) * kA;
+      st.snr += (s.snr - st.snr) * kS;
+      st.lastSeen = now;
+      /* ★ v15.3 轨迹锯齿的真因：GSV 报的方位/仰角是**整数度**（az:49, el:40），
+         天球盘 R≈300 px，1° 方位≈5 px、1° 仰角≈3 px —— 卫星明明是连续移动的，
+         数据却只能一格一格跳，轨迹就成一串折角。
+         这里给轨迹单独维护一组平滑位置（时间常数 45 s 的一阶低通），只用于存点，
+         不影响星点本身的实时响应：1° 阶梯被抹到 ≈0.2°，投影后不到 1 px。 */
+      if (st.taz == null) { st.taz = st.az; st.tel = st.el; }
+      const kT = 1 - Math.exp(-dt / 45);
+      let dT = st.az - st.taz;
+      if (dT > 180) dT -= 360; else if (dT < -180) dT += 360;
+      st.taz = (st.taz + dT * kT + 360) % 360;
+      st.tel += (st.el - st.tel) * kT;
+
+      st.acc += dt;
+      if (st.acc >= TRAIL_STEP) {
+        st.acc = 0;
+        st.hist.push({ az: st.taz, el: st.tel, snr: st.snr });
+        if (st.hist.length > TRAIL_N) st.hist.shift();
+        trailVer++;
+      }
+    }
+    stMap.forEach((st, prn) => {
+      if (!st.gone && now - st.lastSeen > 4500) {         // 从 GSV 消失 → 落下或失锁
+        st.gone = true;
+        const kind = st.el <= 15 ? 'set' : 'lost';        // 低仰角消失=落下, 高仰角消失=疑似遮挡
+        events.push({ prn, kind, t: 0 });
+        lastEvent = events[events.length - 1];
+        if (events.length > 10) events.shift();
+      }
+      if (st.gone && now - st.lastSeen > 300000) stMap.delete(prn);
+    });
+    for (const e of events) e.t += dt;
+  }
+
+  /* ---- 穹底：氛围 + 仰角圈 + 方位辐条 + 天顶 ---- */
+  let baseCv = null, baseKey = '';
+  function drawBase(g) {
+    /* ★ 卡顿治理：穹顶网格/方位刻度/天顶光点全是静态的（只跟几何有关）。
+       缓存到离屏 canvas，尺寸不变就每帧只做一次 drawImage，不再重描 200 多条路径。 */
+    const key = W + 'x' + H + 'x' + DPR;
+    if (!baseCv) baseCv = document.createElement('canvas');
+    if (baseKey !== key) {
+      baseCv.width = cv.width; baseCv.height = cv.height;
+      const bc = baseCv.getContext('2d');
+      bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+      bc.clearRect(0, 0, W, H);
+      drawBaseOn(bc, g);
+      baseKey = key;
+    }
+    ctx.drawImage(baseCv, 0, 0, W, H);
+  }
+
+  function drawBaseOn(c, g) {
+    [0, 30, 60].forEach(el => {
+      c.beginPath();
+      for (let k = 0; k <= 72; k++) {
+        const p = projD(k * 5, el, g);
+        k === 0 ? c.moveTo(p.x, p.y) : c.lineTo(p.x, p.y);
+      }
+      c.strokeStyle = el === 0 ? 'rgba(62,224,255,.35)' : 'rgba(62,224,255,.08)';
+      c.lineWidth = el === 0 ? 1.2 : 0.8; c.stroke();
+    });
+    for (let a = 0; a < 360; a += 30) {
+      const p = projD(a, 0, g);
+      c.beginPath(); c.moveTo(g.cx, g.cy); c.lineTo(p.x, p.y);
+      c.strokeStyle = 'rgba(62,224,255,.05)'; c.lineWidth = 0.8; c.stroke();
+    }
+    c.font = '12px "JetBrains Mono",monospace'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W']].forEach(([az, txt]) => {
+      const p = projD(az, 0, g);
+      const dx = p.x - g.cx, dy = p.y - g.cy, L = Math.hypot(dx, dy) || 1;
+      c.fillStyle = 'rgba(140,205,225,.6)';
+      c.fillText(txt, g.cx + dx / L * (g.R + 15), g.cy + dy / L * (g.R + 15));
+    });
+    c.font = '10px "JetBrains Mono",monospace'; c.fillStyle = 'rgba(150,215,235,.55)';
+    const p60 = projD(0, 60, g), p30 = projD(0, 30, g);
+    c.fillText('60°', p60.x - 15, p60.y); c.fillText('30°', p30.x - 15, p30.y);
+    const zg = c.createRadialGradient(g.cx, g.cy, 0, g.cx, g.cy, 12);
+    zg.addColorStop(0, 'rgba(62,224,255,.5)'); zg.addColorStop(1, 'rgba(62,224,255,0)');
+    c.fillStyle = zg; c.beginPath(); c.arc(g.cx, g.cy, 12, 0, 6.2832); c.fill();
+    c.beginPath(); c.arc(g.cx, g.cy, 2, 0, 6.2832); c.fillStyle = '#c9f4ff'; c.fill();
+  }
+
+  /* ---- 流星尾迹 ----
+     ★ v15.2：原来每星存 130 个点（30 s 一点 ≈ 65 min 历史）再逐段连线。两个毛病：
+     ① 采样太稀，一条长弧被拉成一串折线，观感"弯弯曲曲"；
+     ② 历史越长缓存重绘越贵，每 30 s 一次大重绘正好顶掉一帧。
+     改为 0.12 s 采一点、只留最近 14 点（≈1.7 s）：短、亮、严格贴着卫星的真实
+     位置走，就是一颗流星划过。每帧 26×13≈340 段描边（约 0.4 ms），也不再需要离屏缓存。 */
+  let trailCv = null, trailKey = '', trailDrawn = -1;
+
+  function drawTrails(g) {
+    /* 轨迹只在每 30 s 采到一个新点时才变（trailVer 变化），
+       其余帧只贴一次离屏图，不再逐段重描。 */
+    const key = W + 'x' + H + 'x' + DPR;
+    if (!trailCv) trailCv = document.createElement('canvas');
+    if (trailKey !== key || trailDrawn !== trailVer) {
+      if (trailCv.width !== cv.width || trailCv.height !== cv.height) {
+        trailCv.width = cv.width; trailCv.height = cv.height;
+      }
+      const tc = trailCv.getContext('2d');
+      tc.setTransform(DPR, 0, 0, DPR, 0, 0);
+      tc.clearRect(0, 0, W, H);
+      drawTrailsOn(tc, g);
+      trailKey = key; trailDrawn = trailVer;
+    }
+    ctx.drawImage(trailCv, 0, 0, W, H);
+  }
+
+  function drawTrailsOn(c, g) {
+    c.globalCompositeOperation = 'lighter';
+    c.lineCap = 'round';
+    stMap.forEach(st => {
+      const n = st.hist.length;
+      if (n < 3) return;
+      const sys = SYS[st.sys];
+      if (!sys) return;
+      const col = sys.color;
+      const dim = st.snr > 0 ? 1 : 0.22;
+
+      // 先投影（每点只算一次），仰角在地平线下 / 方位跨 0° 处留断点
+      const pts = [];
+      for (let k = 0; k < n; k++) {
+        const h = st.hist[k];
+        const brk = h.el < 0 || (k > 0 && Math.abs(st.hist[k - 1].az - h.az) > 180);
+        pts.push(brk ? null : projD(h.az, h.el, g));
+      }
+      // 以相邻点中点为端点、原点为控制点 → 折线变光滑曲线，走向不变、只是没有折角
+      for (let k = 1; k < n - 1; k++) {
+        const a = pts[k - 1], b = pts[k], d = pts[k + 1];
+        if (!a || !b || !d) continue;
+        const u = k / n;                                  // 0 = 尾梢, 1 = 星头
+        c.strokeStyle = hexA(col, Math.pow(u, 1.7) * 0.85 * dim);
+        c.lineWidth = 0.5 + u * 2.4;
+        c.beginPath();
+        c.moveTo((a.x + b.x) / 2, (a.y + b.y) / 2);
+        c.quadraticCurveTo(b.x, b.y, (b.x + d.x) / 2, (b.y + d.y) / 2);
+        c.stroke();
+      }
+    });
+    c.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 星芒贴图：四种颜色各预渲染一张，绘制时只做缩放贴图 ----
+     ★ v15.1：原来每颗星每帧都 createRadialGradient() —— 26 星 × 60 fps ≈ 1560 次/秒，
+     渐变对象分配 + 逐像素填充是穹顶最贵的一项。改成一次生成、之后 drawImage 缩放。 */
+  const starGlow = new Map();
+  function starGlowTex(col) {
+    let cv = starGlow.get(col);
+    if (cv) return cv;
+    const R = 32;
+    cv = document.createElement('canvas');
+    cv.width = cv.height = R * 2;
+    const c = cv.getContext('2d');
+    const gl = c.createRadialGradient(R, R, 0, R, R, R);
+    gl.addColorStop(0, hexA(col, 0.34));
+    gl.addColorStop(0.45, hexA(col, 0.10));
+    gl.addColorStop(1, hexA(col, 0));
+    c.fillStyle = gl;
+    c.fillRect(0, 0, R * 2, R * 2);
+    starGlow.set(col, cv);
+    return cv;
+  }
+
+  /* ---- 卫星点 + PRN 标号（每星都标） ---- */
+  function drawStars(g, t) {
+    for (const s of sats) {
+      const st = stMap.get(s.prn); if (!st) continue;
+      const col = SYS[s.sys].color;
+      const p = projD(st.az, st.el, g);
+      const strong = st.snr > 0;
+      const age = performance.now() - (s.born || 0);
+      const pop = age >= 600 ? 1 : Math.max(0.05, 1 + 2.2 * Math.pow(age / 600 - 1, 3) + 1.2 * Math.pow(age / 600 - 1, 2));
+      const rad = (strong ? 2.0 + st.snr * 0.055 : 1.6) * pop;
+      if (strong) {
+        const d = rad * 5.5 * 2;
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.drawImage(starGlowTex(col), p.x - d / 2, p.y - d / 2, d, d);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      // 星核近白、颜色只在外晕与细环上 —— 眼睛看到的是"星"，不是一片色块
+      ctx.beginPath(); ctx.arc(p.x, p.y, rad, 0, 6.2832);
+      ctx.fillStyle = strong ? '#f4fffd' : 'rgba(130,130,130,.5)'; ctx.fill();
+      if (strong) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, rad + 1.6, 0, 6.2832);
+        ctx.strokeStyle = hexA(col, 0.55); ctx.lineWidth = 1; ctx.stroke();
+      }
+      ctx.font = '10.5px "JetBrains Mono",monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = strong ? hexA(col, 0.85) : 'rgba(150,150,150,.5)';
+      ctx.fillText(s.prn, p.x + rad + 4, p.y);
+      /* ★ v16 点选声化：被点中的星套一圈呼吸光环 + ♪ 角标，让"谁在唱"一眼可见 */
+      if (SON.picked.indexOf(s.prn) >= 0) {
+        const pu = 0.5 + 0.5 * Math.sin(t * 2.6 + st.ph);
+        ctx.beginPath(); ctx.arc(p.x, p.y, rad + 4.5 + pu * 2.5, 0, 6.2832);
+        ctx.strokeStyle = hexA(col, 0.55 + pu * 0.35);
+        ctx.lineWidth = 1.4; ctx.stroke();
+        ctx.fillStyle = hexA(col, 0.9);
+        ctx.fillText('♪', p.x + rad + 4, p.y - 10);
+      }
+    }
+  }
+
+  /* ---- 信号流星：星→天顶站，C/N0 越高越密越亮 ---- */
+  function drawMeteors(g, dt) {
+    for (const s of sats) {
+      if (s.snr <= 0 || s.el < 0) continue;
+      if (Math.random() < dt * (1.0 + 7.5 * Math.pow(s.snr / 45, 1.5)))
+        meteors.push({ prn: s.prn, q: 0, sp: 0.10 + Math.random() * 0.06 });
+    }
+    /* ★ v15：原来每条流星要来回切两次 globalCompositeOperation（合成模式切换会让
+       整条绘制流水线重新配置）。整批统一成 lighter，画完再切回来。 */
+    if (!meteors.length) return;
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = meteors.length - 1; i >= 0; i--) {
+      const m = meteors[i]; m.q += m.sp * dt;
+      const st = stMap.get(m.prn);
+      if (!st || st.snr <= 0 || st.el < 0 || m.q >= 1) { meteors.splice(i, 1); continue; }
+      const p = projD(st.az, st.el, g);
+      const q = m.q, q2 = Math.max(0, q - 0.06);
+      const x = p.x + (g.cx - p.x) * q,  y = p.y + (g.cy - p.y) * q;
+      const x2 = p.x + (g.cx - p.x) * q2, y2 = p.y + (g.cy - p.y) * q2;
+      const al = 0.75 * Math.sin(Math.PI * q);
+      ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x, y);
+      ctx.strokeStyle = hexA(SYS[st.sys].color, al); ctx.lineWidth = 1.3; ctx.stroke();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 两侧 C/N0 光幕（原底部帘幕迁此） ---- */
+  function drawCurtains(g, t, ports) {
+    const L = sats.filter(s => s.sys !== 'BDS').sort((a, b) => a.prn < b.prn ? -1 : 1);
+    const Rr = sats.filter(s => s.sys === 'BDS').sort((a, b) => a.prn < b.prn ? -1 : 1);
+    const top = 42, bot = H - 14;
+    ctx.font = '11.5px "JetBrains Mono",monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = hexA(SYS.GPS.color, 0.75);
+    ctx.fillText('GPS · C/N0', 8 + g.curtW / 2, 28);
+    ctx.fillStyle = hexA(SYS.BDS.color, 0.75);
+    ctx.fillText('BDS · C/N0', W - 8 - g.curtW / 2, 28);
+    [[L, 8, 8 + g.curtW], [Rr, W - 8 - g.curtW, W - 8]].forEach(([list, x0, x1]) => {
+      if (!list.length) return;
+      const ch = (bot - top) / list.length;
+      const inX = (x0 < W / 2) ? x1 : x0;                 // 内侧汇流边
+      list.forEach((s, i) => {
+        const st = stMap.get(s.prn);
+        const y0 = top + i * ch, y1 = y0 + ch;
+        const pad = 3, bw = x1 - x0 - pad * 2, bx = x0 + pad;
+        ctx.strokeStyle = 'rgba(62,224,255,.06)';
+        ctx.beginPath(); ctx.moveTo(x0, y1); ctx.lineTo(x1, y1); ctx.stroke();
+        const snr = st ? st.snr : 0;
+        const k = Math.pow(Math.max(0, snr) / 47, 0.8);
+        const bh = Math.max(2, (ch - 14) * k);
+        const yB = y1 - 12, yT = yB - bh;
+        if (snr > 0) {
+          const col = SYS[s.sys].color;
+          const breath = 0.9 + 0.1 * Math.sin(t * 2.2 + (st ? st.ph : 0));
+          const gr = ctx.createLinearGradient(0, yB, 0, yT);
+          gr.addColorStop(0, hexA(col, 0.05));
+          gr.addColorStop(0.75, hexA(col, 0.26 * breath));
+          gr.addColorStop(1, hexA(col, 0.74 * breath));
+          ctx.fillStyle = gr; ctx.fillRect(bx, yT, bw, bh);
+          ctx.globalCompositeOperation = 'lighter';
+          const gr2 = ctx.createLinearGradient(0, yT - 5, 0, yT + 3);
+          gr2.addColorStop(0, hexA(col, 0)); gr2.addColorStop(1, hexA(col, 0.42 * breath));
+          ctx.fillStyle = gr2; ctx.fillRect(bx, yT - 5, bw, 8);
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.font = '10px "JetBrains Mono",monospace'; ctx.textAlign = 'left';
+          ctx.fillStyle = hexA(col, 0.85);
+          ctx.fillText(s.prn, bx + 1, y1 - 2);
+        } else {
+          ctx.fillStyle = 'rgba(255,255,255,.03)';
+          ctx.fillRect(bx, y0 + pad, bw, ch - pad * 2);
+          ctx.font = '10px "JetBrains Mono",monospace'; ctx.textAlign = 'left';
+          ctx.fillStyle = 'rgba(170,170,170,.55)';
+          ctx.fillText(s.prn, bx + 1, y1 - 2);
+        }
+        ports[s.prn] = { x: inX, y: (y0 + y1) / 2 - 4 };
+      });
+    });
+    ctx.strokeStyle = 'rgba(62,224,255,.14)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(8 + g.curtW, top - 10); ctx.lineTo(8 + g.curtW, bot); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W - 8 - g.curtW, top - 10); ctx.lineTo(W - 8 - g.curtW, bot); ctx.stroke();
+  }
+
+  /* ---- 神经网络光带：参与解算的星 ← 光幕那格 ----
+     ★ 2026-10-31 v8b：原来一颗星同时跑 3 个脉冲、每 4.5 s 一轮，看久了发腻。
+     改成"一发到站才发下一发"：同一时刻每颗星只有 1 个脉冲，头带 38% 长尾，
+     头到卫星位置才归零重发；走过的路径留一道比底纹略亮的航迹。 ---- */
+  function ribbonPts(p0, p2, ph, t) {
+    const cp = { x: (p0.x + p2.x) / 2, y: (p0.y + p2.y) / 2 + (ph > 3.14 ? 60 : -60) };
+    const pts = [];
+    for (let k = 0; k <= 34; k++) {
+      const u = k / 34, v = 1 - u;
+      let x = v * v * p0.x + 2 * v * u * cp.x + u * u * p2.x;
+      let y = v * v * p0.y + 2 * v * u * cp.y + u * u * p2.y;
+      const dx = 2 * (v * (cp.x - p0.x) + u * (p2.x - cp.x));
+      const dy = 2 * (v * (cp.y - p0.y) + u * (p2.y - cp.y));
+      const Ln = Math.hypot(dx, dy) || 1;
+      const off = Math.sin(u * 6.2832 * 1.5 + t * 3.0 + ph) * 6.5 * Math.sin(Math.PI * u);
+      x += -dy / Ln * off; y += dx / Ln * off;
+      pts.push({ x, y });
+    }
+    return pts;
+  }
+  function drawRibbons(g, t, ports) {
+    const gsFixed = gnssNow();                 // ★ v15：每帧只取一次（原来每星一次，23 次/帧）
+    for (const s of sats) {
+      if (!s.ok || s.el < 3) continue;                    // 参与解算 + 已升离地平线
+      const port = ports[s.prn]; if (!port) continue;
+      const st = stMap.get(s.prn); if (!st) continue;
+      const col = SYS[s.sys].color;
+      const p2 = projD(st.az, st.el, g);
+      const pts = ribbonPts(port, p2, st.ph, t);
+      const N = pts.length;
+
+      /* 底纹：很淡的静态骨架，保证不发射时也能看出"这星连到那格" */
+      ctx.beginPath();
+      pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+      ctx.strokeStyle = hexA(col, 0.075); ctx.lineWidth = 1.1; ctx.stroke();
+
+      /* 一星一脉冲：跟 1PPS 同拍 —— 每秒发一发、飞行固定 1.0 s，与路径长短无关。
+         剩余 8% 留给"到站涟漪"。每星相位错开，避免整屏齐步走。
+         ★ v9b：用户反馈原来 6~7.4 s 一轮"像蝌蚪慢慢腾腾爬过去"，改为秒级到达。 */
+      const CYCLE = 1.0, FLIGHT = 0.92;
+      const ph01 = (st.ph / 6.2832) % 1;
+      const gs = gsFixed;                          // 以 GNSS 秒为节拍（真没有就用帧时间）
+      const q = (((gs === null ? t : gs) / CYCLE) + ph01) % 1;   // 这一秒内走到哪
+      const flying = q < FLIGHT;
+      const head = Math.min(1, q / FLIGHT);        // 0→1 = 到站
+
+      ctx.globalCompositeOperation = 'lighter';
+
+      /* 尾迹：飞得快，尾巴收到 22% 就够，"长尾"反而会糊成一团 */
+      const TAIL = 0.22, SEG = 6;
+      for (let k = 0; k < SEG; k++) {
+        const u1 = head - TAIL * (k / SEG);
+        const u0 = head - TAIL * ((k + 1) / SEG);
+        if (u1 <= 0) break;
+        const a = 0.72 * Math.pow(1 - k / SEG, 2.1);
+        const i0 = Math.max(0, Math.floor(Math.max(0, u0) * (N - 1)));
+        const i1 = Math.min(N - 1, Math.floor(Math.min(1, u1) * (N - 1)));
+        if (i1 <= i0) continue;
+        ctx.beginPath();
+        for (let i = i0; i <= i1; i++) i === i0 ? ctx.moveTo(pts[i].x, pts[i].y) : ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.strokeStyle = hexA(col, a); ctx.lineWidth = 2.6 - k * 0.21; ctx.stroke();
+      }
+
+      /* 航迹：飞行中把走过的这段提亮；空档期不画，否则整条一直亮着就没有"在飞"的感觉 */
+      const hi = Math.min(N - 1, Math.floor(clamp(head, 0, 1) * (N - 1)));
+      if (flying && hi > 1) {
+        ctx.beginPath();
+        for (let i = 0; i <= hi; i++) i ? ctx.lineTo(pts[i].x, pts[i].y) : ctx.moveTo(pts[i].x, pts[i].y);
+        ctx.strokeStyle = hexA(col, 0.15); ctx.lineWidth = 1.3; ctx.stroke();
+      }
+
+      /* 头：亮点 + 光晕（用两层圆代替 shadowBlur —— 软件渲染下 shadow 太贵） */
+      if (flying && head > 0.005) {
+        const hp = pts[hi];
+        ctx.beginPath(); ctx.arc(hp.x, hp.y, 5.5, 0, 6.2832);
+        ctx.fillStyle = hexA(col, 0.16); ctx.fill();
+        ctx.beginPath(); ctx.arc(hp.x, hp.y, 2.4, 0, 6.2832);
+        ctx.fillStyle = hexA(col, 0.95); ctx.fill();
+      }
+
+      /* 到站闪光：最后 6% 在卫星位置开一圈涟漪 */
+      if (flying && head > 0.94) {
+        const qq = (head - 0.94) / 0.06;
+        ctx.beginPath(); ctx.arc(p2.x, p2.y, 2 + qq * 9, 0, 6.2832);
+        ctx.strokeStyle = hexA(col, 0.45 * (1 - qq)); ctx.lineWidth = 1.2; ctx.stroke();
+      }
+
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.beginPath(); ctx.arc(port.x, port.y, 2, 0, 6.2832);
+      ctx.fillStyle = hexA(col, 0.9); ctx.fill();
+    }
+  }
+
+  /* ---- 升落/失锁涟漪 + 事件行 ---- */
+  function drawEvents(g, t) {
+    for (const e of events) {
+      const st = stMap.get(e.prn); if (!st) continue;
+      const q = e.t / 1.6;
+      const p = e.kind === 'rise' ? projD(st.az, 0, g) : projD(st.az, Math.max(st.el, 0), g);
+      const col = e.kind === 'lost' ? '#ff9a6b' : SYS[st.sys].color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3 + q * 42, 0, 6.2832);
+      ctx.strokeStyle = hexA(col, 0.55 * (1 - q)); ctx.lineWidth = 1.4; ctx.stroke();
+    }
+    if (lastEvent && lastEvent.t < 6) {
+      const a = Math.min(1, (6 - lastEvent.t) / 2);
+      const st = stMap.get(lastEvent.prn);
+      const col = lastEvent.kind === 'lost' ? '#ff9a6b'
+                : (st ? SYS[st.sys].color : '#3ee0ff');
+      const txt = (lastEvent.kind === 'rise' ? '▲ ' : lastEvent.kind === 'set' ? '▼ ' : '✕ ')
+                + lastEvent.prn
+                + (lastEvent.kind === 'rise' ? ' 升起' : lastEvent.kind === 'set' ? ' 落下' : ' 失锁(疑似遮挡)');
+      ctx.font = '13px "JetBrains Mono",monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = hexA(col, a);
+      ctx.fillText(txt, g.cx, g.cy - g.R - 26);
+    }
+  }
+
+  function draw(t, dt) {
+    ctx.clearRect(0, 0, W, H);
+    const g = geom();
+    const now = performance.now();
+    updateStates(dt, now);
+    const ports = {};
+    drawBase(g, t);
+    drawTrails(g);
+    drawCurtains(g, t, ports);            // ★ 先画光幕：ports 坐标要给光带用
+    drawRibbons(g, t, ports);
+    drawMeteors(g, dt);
+    drawStars(g, t);
+    drawEvents(g, t);
+  }
+  resize();
+
+  let last = performance.now();
+
+  /* ★ v15 现场诊断：地址后加 ?diag=1（如 http://127.0.0.1:8787/?diag=1）右上角会出现一行
+     小字：帧率 / 最近 1 s 内最差帧间隔 / 本页渲染耗时 / 轮询耗时 / JS 堆。
+     卡顿时看它：最差帧 >> 16.7ms 说明渲染超预算；堆一直涨说明有泄漏。平时不显示、零开销。 */
+  const DIAG = /[?&]diag=1/.test(location.search);
+  const BUILD = 'v15.5 / 10-31 21:30';
+  /* ★ v15.1 轻量模式：省掉全屏扫光与列表动画、穹顶 30 fps。
+     用于判断"卡"到底来自页面合成还是机器本身。 */
+  const LITE = /[?&]lite=1/.test(location.search) ||
+    (() => { try { return localStorage.getItem('gnss.lite') === '1'; } catch (e) { return false; } })();
+  if (LITE) document.documentElement.classList.add('lite');
+  let dgBox = null, dgFrames = 0, dgT0 = 0, dgWorst = 0, dgPrev = 0, dgRender = 0, dgPoll = 0, dgDrop = 0, dgLastDrop = 0;
+  const dgSlow = [];
+  function diagTick(now) {
+    if (!DIAG) return;
+    if (!dgBox) {
+      dgBox = document.createElement('div');
+      dgBox.style.cssText = 'position:fixed;right:8px;top:8px;z-index:9998;padding:3px 8px;' +
+        'font:11px/1.5 "JetBrains Mono",monospace;color:#9fe8ff;background:rgba(4,18,26,.82);' +
+        'border:1px solid rgba(62,224,255,.35);border-radius:4px;cursor:pointer;white-space:nowrap';
+      dgBox.title = '点击切换轻量模式';
+      dgBox.addEventListener('click', () => {
+        try { localStorage.setItem('gnss.lite', LITE ? '0' : '1'); } catch (e) {}
+        location.reload();
+      });
+      document.body.appendChild(dgBox);
+    }
+    /* ★ v15.2：原来"卡顿"只统计 >50 ms 的帧，而且最差帧每秒清零 —— 那种能看出
+       一次、抓不到第二次的周期性顿挫根本记不住。现在改为记录最近 20 s 内所有
+       >20 ms 的帧，并显示"最近一次距今几秒"，周期性卡顿会自己暴露节拍。 */
+    if (dgPrev) {
+      const g = now - dgPrev;
+      if (g > dgWorst) dgWorst = g;
+      if (g > 20) { dgSlow.push(now); if (dgSlow.length > 400) dgSlow.shift(); }
+      if (g > 50) { dgDrop++; if (!dgLastDrop) dgLastDrop = now; }
+    }
+    dgPrev = now; dgFrames++;
+    if (!dgT0) dgT0 = now;
+    if (now - dgT0 >= 1000) {
+      while (dgSlow.length && now - dgSlow[0] > 20000) dgSlow.shift();
+      const fps = dgFrames * 1000 / (now - dgT0);
+      const mem = performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) + 'MB' : '--';
+      const since = dgSlow.length ? ((now - dgSlow[dgSlow.length - 1]) / 1000).toFixed(1) : null;
+      dgBox.textContent = 'FPS ' + fps.toFixed(0) + '  最差帧 ' + dgWorst.toFixed(0) + 'ms' +
+        '  慢帧 ' + dgSlow.length + (since !== null ? '(最近 ' + since + 's 前)' : '') +
+        '  卡顿 ' + dgDrop + ' 次  渲染 ' + dgRender.toFixed(1) + 'ms  轮询 ' + dgPoll.toFixed(1) + 'ms  堆 ' + mem +
+        '  ' + BUILD + (LITE ? '  [LITE]' : '');
+      dgFrames = 0; dgT0 = now; dgWorst = 0;
+    }
+  }
+
+  let lastDrawAt = 0;
+  function loop(now) {
+    if (document.hidden) { last = now; requestAnimationFrame(loop); return; }   // ★ 隐藏即暂停
+    const dt = Math.min(64, now - last);
+    last = now;
+    /* ★ v15.1 轻量模式：穹顶与走带降到 30 fps（卫星 2 s 才更新一次，30 fps 完全够），
+       主线程占用直接减半；声化仍按 60 fps 判定，不影响听感。 */
+    if (!LITE || now - lastDrawAt >= 31) {
+      lastDrawAt = now;
+      if (DIAG) dgRender = performance.now();
+      draw(now / 1000, dt / 1000);          // v3 穹顶引擎：真实时间流速，无加速无自转
+      drawPpsBand();                         // ★ 2026-10-31:04 脉冲对比带(连续滚动)
+      if (DIAG) dgRender = performance.now() - dgRender;
+    }
+    sonTick(now);                          // ★ v13:08 C/N0 声化(平滑/换音/音高带/24s 走向)
+    diagTick(now);
+    requestAnimationFrame(loop);
+  }
+
+  /* ---- 04 SQW−PPS 脉冲对比带(★ 2026-10-31 改版) ----
+     OBS 是 5 s 一拍,所以不按真实时间轴铺 —— 按"拍"铺:每拍一格,
+     格内 1 格宽 = 1 s 相位。上带 = GNSS PPS(金),下带 = DS3231 SQW(青),
+     两带固定分层,横向错位 = 相位差:Δ>0 时 SQW 脉冲在右(= 滞后),Δ<0 在左;
+     带间斜线把同一拍的两个脉冲绑在一起 —— 谁在前谁在后不用读数字也看得出来。
+     只保留一行"Δ / 频差"读数;相位历史与回归半圆表按去重结论退场。 ---- */
+  const BAND_BEATS = 12;                 // ★ v15.2：可见 12 秒（PPS 本身就是 1 Hz）
+  const BAND_SLOTS = BAND_BEATS;         // 12 格 = 12 s 窗口
+  const BAND_PERIOD = 1;                 // ★ 1 秒一拍，与物理 PPS 同拍
+
+  /* ★ v15.2：PPS 是每秒一个物理脉冲，带子也必须每秒一拍。
+     OBS 只有 5 s 一个采样，所以按秒展开、在相邻采样之间线性插值，
+     得到连续的每秒脉冲序列 —— 物理上正确，观感上才是真正的 1 Hz 心跳。
+     结果按 (采样数, 当前整秒, 末采样) 缓存，秒不变就复用，不每帧重建。 */
+  let ppsBeats = [], ppsBeatsKey = '';
+  function buildPpsBeats(obs, nowS) {
+    const raw = obs.filter(o => o.pps > -0.99 && o.t > 0);
+    if (raw.length < 2 || !nowS) return [];
+    const lastT = Math.floor(nowS);
+    const key = raw.length + '|' + lastT + '|' + raw[raw.length - 1].t + ':' + raw[raw.length - 1].pps;
+    if (key === ppsBeatsKey) return ppsBeats;
+    ppsBeatsKey = key;
+    const out = [];
+    const vFirst = raw[0].pps, vLast = raw[raw.length - 1].pps;
+    for (let s = lastT - BAND_SLOTS + 1; s <= lastT; s++) {
+      if (s <= raw[0].t) { out.push({ t: s, pps: vFirst }); continue; }
+      if (s >= raw[raw.length - 1].t) { out.push({ t: s, pps: vLast }); continue; }
+      let v = vLast;
+      for (let i = 0; i < raw.length - 1; i++) {
+        const a = raw[i], b = raw[i + 1];
+        if (s >= a.t && s <= b.t) {
+          v = b.t > a.t ? a.pps + (b.pps - a.pps) * ((s - a.t) / (b.t - a.t)) : a.pps;
+          break;
+        }
+      }
+      out.push({ t: s, pps: v });
+    }
+    ppsBeats = out;
+    return out;
+  }
+
+  /* GNSS 时间轴：用 OBS 第 18 列 utc 做基准，PC 只负责插值 —— 与顶部 UTC 同一口径
+     ★ v9b（走带跳动的真因）：旧写法 `k.crt + (performance.now()-lastRx)/1000`，
+     而 lastRx 是**每 2 s 轮询**就刷新的，k.crt 却只在 5 s 的 OBS 包更新。于是每轮询
+     时间轴就回退 0~2 s（面板宽 260 px、一格 5 s 时约 15 px），再花 2 s 追回来 ——
+     观感正是"从右往左走一段、又退回来"。现在改为 crt 变化时才重锚 + 单调递增保护。 */
+  /* ★ v15.2 卡顿真因：OBS 是 5 s 一拍，而 crt 的增量与实际经过时间并不相等
+     （实测每拍差 0.1~1.1 s，首包 2.1 s）。旧写法每次 crt 变了就用"此刻"当锚点，
+     于是 timeNow 会**瞬间前跳/回跳** 0.1~1 s —— 帧一个没少（FPS/最差帧全正常），
+     但走带、脉冲、秒针整体"顿"一下，人眼看到的就是"每隔十秒卡一下"。
+     改为时钟驯服：显示时间按真实 dt 匀速前进，偏差只用限速纠正（≤35% 倍速），
+     永远连续，绝不跳变。 */
+  let crtAnchor = 0, crtAnchorAt = 0, gnssLast = 0, gnssInit = false, gnssPrevAt = 0;
+  function gnssNow() {
+    const k = live && live.kpi;
+    if (!k || !k.crt) return null;
+    const pn = performance.now() / 1000;
+    if (k.crt !== crtAnchor) { crtAnchor = k.crt; crtAnchorAt = pn; }
+    const target = crtAnchor + (pn - crtAnchorAt);
+
+    if (!gnssInit) { gnssInit = true; gnssLast = target; gnssPrevAt = pn; return gnssLast; }
+
+    let dt = pn - gnssPrevAt;
+    if (!(dt > 0)) dt = 0;
+    if (dt > 0.25) dt = 0.25;                  // 页面被挂起后回来，别一次追太多
+    gnssPrevAt = pn;
+
+    const err = target - gnssLast;
+    if (Math.abs(err) > 5) { gnssLast = target; return gnssLast; }   // 重新校时：直接对齐
+    const corr = clamp(err * 0.06, -0.35 * dt, 0.35 * dt);
+    gnssLast += dt + corr;
+    return gnssLast;
+  }
+
+  /* ★ 卡顿治理：drawPpsBand 跑在 rAF 里，原来每帧都 getBoundingClientRect()。
+     这个调用会**强制浏览器立刻做完所有待处理的布局**——而 poll 每 2 秒刚改过
+     表格/文字，正好把整页重排记到这一帧上，表现就是"每隔几秒卡一下"。
+     尺寸改为布局变化时测一次（resize / 面板拖拽都会触发），帧内零测量。 */
+  function bandMeasure() {
+    if (!bandCv) bandCv = document.getElementById('chPpsG');   // 这函数在 el() 定义之前就会被 resize() 调到
+    if (!bandCv) return;
+    const r = bandCv.getBoundingClientRect();
+    bandW = r.width; bandH = r.height;
+    bandDpr = Math.min(window.devicePixelRatio || 1, (bandW * bandH > 150000) ? 1.25 : 2);
+    const pw = Math.round(bandW * bandDpr), ph = Math.round(bandH * bandDpr);
+    if (bandCv.width !== pw || bandCv.height !== ph) { bandCv.width = pw; bandCv.height = ph; }
+  }
+
+  function drawPpsBand() {
+    const cv = bandCv || (bandCv = document.getElementById('chPpsG')); if (!cv) return;
+    const dpr = bandDpr, w = bandW, h = bandH;
+    if (w < 80 || h < 60) return;
+    const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    const k = live && live.kpi;
+    const obs = (live && live.obs) || [];
+    const nowS = gnssNow();                                    // ★ 每帧只取一次
+    const beats = buildPpsBeats(obs, nowS);
+    const hasPps = !!(k && k.pps > -0.99) && beats.length > 0;
+
+    /* —— 版面 —— */
+    const x0 = 46, x1 = w - 12;
+    if (x1 - x0 < 60) return;
+    const topY = 46, botY = h - 18;
+    const laneH = clamp((botY - topY) * 0.24, 13, 30);
+    // 面板被拉高时带子不再跟着拉满：层隔封顶 150px，整体垂直居中
+    const span = Math.min(botY - topY, 150);
+    const midY = (topY + botY) / 2;
+    const yP = midY - span / 2 + laneH * 0.5 + 2;
+    const yQ = midY + span / 2 - laneH * 0.5;
+    const cellW = (x1 - x0) / BAND_SLOTS;
+
+    /* —— 走带相位（★ v9 无缝版）——
+       旧写法 prog=clamp((now−lastT)/5,0,1)：新拍一到 prog 归零，整条带子向右跳回一格，
+       观感就是"往左走一下又退回来"。现改为时间轴映射：
+           x(t) = x1 − (tNow − t)/5 × cellW
+       tNow 单调增 → 每个脉冲匀速左移、右缘进入、左缘淡出，没有任何复位跳变。
+       格线只取走带相位的小数部分平移，整数格由相邻拍的 t 差自然铺开。 */
+    const lastT = beats.length ? beats[beats.length - 1].t : 0;
+    const tNow = nowS || (lastT ? lastT + BAND_PERIOD * 0.5 : 0);
+    const xOfT = t => x1 - ((tNow - t) / BAND_PERIOD) * cellW;
+    const frac = lastT ? (((tNow - lastT) / BAND_PERIOD) % 1 + 1) % 1 : 0;
+
+    /* —— 读数:Δ / 方向 / 频差 —— */
+    const pps = hasPps ? k.pps : null;
+    g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+    g.font = '9.5px "JetBrains Mono",monospace'; g.fillStyle = '#7fa2b3';
+    g.fillText('Δ', 12, 21);
+    g.font = '19px "JetBrains Mono",monospace';
+    g.fillStyle = pps === null ? '#44606f' : '#e6f9ff';
+    g.fillText(pps === null ? '---' : (pps >= 0 ? '+' : '') + pps.toFixed(1) + ' ms', 25, 22);
+    if (pps !== null) {
+      const dir = Math.abs(pps) < 0.15 ? '同相' : (pps > 0 ? 'SQW 滞后' : 'SQW 超前');
+      const ppmTxt = phasePpm === null ? '' :
+        ' · 频差 ' + (phasePpm > 0 ? '+' : '') + phasePpm.toFixed(2) + ' ppm';
+      g.font = '9.5px "JetBrains Mono",monospace'; g.fillStyle = '#7fa2b3';
+      g.fillText(dir + ' ' + Math.abs(pps).toFixed(0) + ' ms' + ppmTxt, 12, 36);
+    } else {
+      g.font = '9.5px "JetBrains Mono",monospace'; g.fillStyle = '#44606f';
+      g.fillText('无 1PPS / 本地钟未接', 12, 36);
+    }
+    g.textAlign = 'right'; g.fillStyle = '#4f6b7b';
+    g.font = '9px "JetBrains Mono",monospace';
+    g.fillText('← 时间 · 1 格 = 1 s', x1, 21);
+    g.fillStyle = '#3a5665';
+    g.fillText('PPS 1 Hz · 每秒一拍', x1, 32);
+
+    /* —— 两条带(固定层隔) —— */
+    const lane = (y, rgb) => {
+      g.fillStyle = 'rgba(' + rgb + ',.05)';
+      g.fillRect(x0, y - laneH / 2, x1 - x0, laneH);
+      g.strokeStyle = 'rgba(' + rgb + ',.16)'; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x0, y - laneH / 2); g.lineTo(x1, y - laneH / 2); g.stroke();
+      g.beginPath(); g.moveTo(x0, y + laneH / 2); g.lineTo(x1, y + laneH / 2); g.stroke();
+    };
+    lane(yP, '245,197,66');
+    lane(yQ, '62,224,255');
+
+    /* —— 会走的格线 + 右缘"入口" —— */
+    g.strokeStyle = 'rgba(62,200,230,.13)'; g.lineWidth = 1;
+    g.setLineDash([2, 4]);
+    for (let s = 0; s <= BAND_SLOTS; s++) {
+      const x = x1 - (s + frac) * cellW;
+      if (x < x0 - 1 || x > x1 + 1) continue;
+      g.beginPath(); g.moveTo(x, yP - laneH / 2 - 4); g.lineTo(x, yQ + laneH / 2 + 4); g.stroke();
+    }
+    g.setLineDash([]);
+    g.strokeStyle = 'rgba(62,224,255,.45)'; g.lineWidth = 1.2;
+    g.beginPath(); g.moveTo(x1, yP - laneH / 2 - 6); g.lineTo(x1, yQ + laneH / 2 + 6); g.stroke();
+    // 右缘呼吸箭头：告诉眼睛"从这边进来、往左走"
+    const br = 0.35 + 0.35 * Math.sin(performance.now() / 420);
+    g.fillStyle = 'rgba(62,224,255,' + br.toFixed(2) + ')';
+    g.beginPath(); g.moveTo(x1 + 6, yP - 3); g.lineTo(x1 + 6, yP + 3); g.lineTo(x0 + 2, yP + 3);
+    g.lineTo(x0 + 2, yP - 3); g.closePath(); g.fill();
+
+    g.font = '10px "JetBrains Mono",monospace'; g.textAlign = 'right'; g.textBaseline = 'middle';
+    g.fillStyle = '#f5c542'; g.fillText('PPS', x0 - 8, yP);
+    g.fillStyle = '#3ee0ff'; g.fillText('SQW', x0 - 8, yQ);
+    g.textBaseline = 'alphabetic';
+
+    /* —— 脉冲对：上下错位 = Δ ——
+       ★ v9：以前只在最新一拍底部画一条括号，看着像"只有第五个脉冲有线"。
+       现在每一对都在层隔中线画一条 Δ 标尺（横杠 + 两端竖钩），最新一对加亮加粗；
+       读法是"每一拍差多少"一直挂在带上，而不是只在某一格出现一次。 */
+    const bh = laneH * 0.74;
+    const yMid = (yP + yQ) / 2;
+    beats.forEach((o, i) => {
+      const xp = xOfT(o.t) + cellW * 0.16;
+      const dPx = clamp(o.pps, -520, 520) / 1000 * cellW;
+      const xs = xp + dPx;
+      const fadeR = clamp((x1 + cellW * 0.12 - xp) / (cellW * 0.5), 0, 1);   // 右缘淡入
+      const fadeL = clamp((xp - x0) / (cellW * 0.55), 0, 1);                 // 左缘淡出
+      const fresh = clamp((xp - x0) / Math.max(1, x1 - x0), 0.3, 1);         // 越新越亮
+      const a = fresh * fadeL * fadeR;
+      if (a <= 0.02) return;
+      const isNew = i === beats.length - 1;
+
+      // 配对斜线：把上下两个脉冲绑成"同一拍"
+      g.globalAlpha = a * (isNew ? 0.8 : 0.45);
+      g.strokeStyle = 'rgba(170,214,228,.9)'; g.lineWidth = isNew ? 1.2 : 1;
+      g.beginPath(); g.moveTo(xp, yP + laneH * 0.28); g.lineTo(xs, yQ - laneH * 0.28); g.stroke();
+
+      // 两条脉冲（不用 shadowBlur：1680 宽软件渲染下极贵）
+      g.globalAlpha = a;
+      g.fillStyle = '#f5c542';
+      g.fillRect(xp - 1.5, yP - bh / 2, isNew ? 3.4 : 2.6, bh);
+      g.fillStyle = '#3ee0ff';
+      g.fillRect(xs - 1.5, yQ - bh / 2, isNew ? 3.4 : 2.6, bh);
+
+      // Δ 标尺：层隔中线上，左端 PPS / 右端 SQW，长度就是相位差
+      if (Math.abs(xs - xp) > 2.5) {
+        g.globalAlpha = a * (isNew ? 0.9 : 0.42);
+        g.strokeStyle = isNew ? 'rgba(236,252,255,.95)' : 'rgba(150,196,212,.85)';
+        g.lineWidth = isNew ? 1.3 : 1;
+        g.beginPath(); g.moveTo(xp, yMid); g.lineTo(xs, yMid); g.stroke();
+        g.beginPath(); g.moveTo(xp, yMid - 3.5); g.lineTo(xp, yMid + 3.5); g.stroke();
+        g.beginPath(); g.moveTo(xs, yMid - 3.5); g.lineTo(xs, yMid + 3.5); g.stroke();
+        if (isNew && Math.abs(xs - xp) > 30 && Math.abs(o.pps) < 999) {
+          g.globalAlpha = 0.95;
+          g.font = '9px "JetBrains Mono",monospace';
+          g.textAlign = 'center'; g.textBaseline = 'bottom';
+          g.fillStyle = '#cfeaf5';
+          g.fillText((o.pps >= 0 ? '+' : '') + o.pps.toFixed(0) + ' ms', (xp + xs) / 2, yMid - 5);
+          g.textBaseline = 'alphabetic';
+        }
+      }
+      g.globalAlpha = 1;
+    });
+
+    /* 左缘淡出遮罩：走带感 */
+    const fade = g.createLinearGradient(x0, 0, x0 + cellW * 0.7, 0);
+    fade.addColorStop(0, 'rgba(4,8,11,.92)');
+    fade.addColorStop(1, 'rgba(4,8,11,0)');
+    g.fillStyle = fade;
+    g.fillRect(x0, topY - 10, cellW * 0.7, botY - topY + 20);
+  }
+
+  /* =========================================================
+     05 位置偏移 —— 三种诚实画法（只有标量距离，没有方位角，所以不做东北散点）
+       ring  靶环表：指针看"现在在绿/黄/红哪一档"，外圈浅弧 = 历史包络
+       ruler 标尺条：分区尺 + 当前旗标 + 历史须线（min/中位/max）
+       heat  热条带：一格 = 若干秒，颜色 = 偏移大小，看"什么时候偏、偏了多久"
+     数据源 offLong（OBS 每 5 s 一点），阈值 OFF_LIMIT = 30 m。
+     ========================================================= */
+  const OFF_SCALE = 36;                    // 表盘/标尺量程（30 m 警戒线留 20% 余量）
+  const OFF_WARN = 15;                     // 15 m 以上进"黄区"（阳台常态多径的上沿）
+  let offViz = 'ring';
+  try { offViz = localStorage.getItem('gnss.offviz') || 'ring'; } catch (e) { offViz = 'ring'; }
+
+  function offSeries() {
+    return offLong.filter(v => v >= 0);
+  }
+
+  function drawOffViz() {
+    const cv = el('chOff'); if (!cv) return;
+    const c = prep(cv); if (!c) return;
+    const g = c.g, w = c.w, h = c.h;
+    const vals = offSeries();
+    const cur = (live && live.kpi && live.kpi.off >= 0) ? live.kpi.off : (vals.length ? vals[vals.length - 1] : null);
+
+    if (offViz === 'ruler') return drawOffRuler(g, w, h, vals, cur);
+    if (offViz === 'heat') return drawOffHeat(g, w, h, vals, cur);
+    return drawOffRing(g, w, h, vals, cur);
+  }
+
+  function offTagOf(v) {
+    if (v === null) return ['---', '#6d93a5'];
+    if (v >= OFF_LIMIT) return ['超限', '#ff6b35'];
+    if (v >= OFF_WARN) return ['黄区', '#f5c542'];
+    return ['正常', '#2fe08a'];
+  }
+
+  /* ---------- A 靶环表 ---------- */
+  function drawOffRing(g, w, h, vals, cur) {
+    /* ★ v9：圆环必须完整落在卡片内。旧式 R=min(0.40w, 0.62h) 只看了半径，
+       没给"圆弧顶 + 外圈包络 + 刻度数字"留垂直预算，面板一矮顶部就被卡片上沿裁掉。
+       现在先扣掉上下内边距，再按 1.58R 的总高反推半径。 */
+    const padT = 12, padB = 18;
+    const R = Math.min(w * 0.40, (h - padT - padB) / 1.58);
+    if (R < 22) return;
+    const cx = w / 2, cy = padT + R * 1.12;
+    const A0 = -128 * D2R, A1 = 128 * D2R;                  // 以 12 点为 0，左右各 128°
+    const ang = v => A0 + (clamp(v, 0, OFF_SCALE) / OFF_SCALE) * (A1 - A0);
+    const pt = (v, rr) => ({ x: cx + Math.sin(ang(v)) * rr, y: cy - Math.cos(ang(v)) * rr });
+    const arc = (v0, v1, rr) => {
+      g.beginPath(); g.arc(cx, cy, rr, ang(v0) - Math.PI / 2, ang(v1) - Math.PI / 2);
+      g.stroke();
+    };
+
+    // 底槽
+    g.lineCap = 'butt';
+    g.strokeStyle = 'rgba(62,200,230,.10)'; g.lineWidth = Math.max(7, R * 0.13);
+    arc(0, OFF_SCALE, R);
+    // 分区：正常 / 黄区 / 超限
+    g.lineWidth = Math.max(6, R * 0.10);
+    g.strokeStyle = 'rgba(47,224,138,.32)'; arc(0, OFF_WARN, R);
+    g.strokeStyle = 'rgba(245,197,66,.34)'; arc(OFF_WARN, OFF_LIMIT, R);
+    g.strokeStyle = 'rgba(255,107,53,.45)'; arc(OFF_LIMIT, OFF_SCALE, R);
+
+    // 历史包络：最近窗口的 min~max 画成外圈细弧
+    if (vals.length > 1) {
+      const mn = Math.min(...vals), mx = Math.max(...vals);
+      g.lineWidth = 2.2; g.strokeStyle = 'rgba(62,224,255,.42)';
+      arc(mn, mx, R + Math.max(9, R * 0.16));
+      const pm = pt(mn, R + Math.max(9, R * 0.16)), px = pt(mx, R + Math.max(9, R * 0.16));
+      g.fillStyle = 'rgba(62,224,255,.55)';
+      g.beginPath(); g.arc(pm.x, pm.y, 1.6, 0, 6.2832); g.fill();
+      g.beginPath(); g.arc(px.x, px.y, 1.6, 0, 6.2832); g.fill();
+    }
+
+    // 刻度（★ v9：数字移到弧内侧，圆环外沿不再往外长）
+    g.font = Math.round(clamp(R * 0.11, 8, 10.5)) + 'px "JetBrains Mono",monospace';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    [0, 10, 20, 30].forEach(v => {
+      const p1 = pt(v, R - Math.max(5, R * 0.08)), p2 = pt(v, R - Math.max(9, R * 0.13));
+      g.strokeStyle = v === OFF_LIMIT ? 'rgba(255,107,53,.8)' : 'rgba(125,170,190,.35)';
+      g.lineWidth = 1;
+      g.beginPath(); g.moveTo(p1.x, p1.y); g.lineTo(p2.x, p2.y); g.stroke();
+      const tp = pt(v, R - Math.max(13, R * 0.21));
+      g.fillStyle = v === OFF_LIMIT ? '#ff9a6b' : '#5b7a8c';
+      g.fillText(String(v), tp.x, tp.y);
+    });
+
+    // 指针
+    if (cur !== null) {
+      const tag = offTagOf(cur);
+      const p = pt(cur, R - Math.max(4, R * 0.06));
+      const q = pt(cur, R * 0.24);
+      /* ★ 卡顿治理：canvas 阴影（shadowBlur）每次都要走一遍高斯模糊，是这块面板最贵的操作，
+         而它每 2 秒随 poll 重绘一次 —— 正好落在动画帧上。改用「粗淡底 + 细亮芯」两层描边，
+         发光观感一致，成本降一个量级。 */
+      g.beginPath(); g.moveTo(q.x, q.y); g.lineTo(p.x, p.y);
+      g.strokeStyle = hexA(tag[1], 0.18); g.lineWidth = 7; g.stroke();
+      g.strokeStyle = tag[1]; g.lineWidth = 2.2; g.stroke();
+      g.beginPath(); g.arc(p.x, p.y, 3.2, 0, 6.2832); g.fillStyle = tag[1]; g.fill();
+    }
+
+    // 中心读数
+    g.textAlign = 'center';
+    g.fillStyle = '#7fa2b3'; g.font = '9.5px "JetBrains Mono",monospace';
+    g.fillText('当前偏移 · 限 30 m', cx, cy - R * 0.22);
+    g.fillStyle = cur === null ? '#44606f' : '#f0fbff';
+    g.font = 'bold ' + Math.round(clamp(R * 0.40, 16, 28)) + 'px "JetBrains Mono",monospace';
+    g.fillText(cur === null ? '---' : cur.toFixed(1), cx, cy + R * 0.08);
+    g.fillStyle = '#7fa2b3'; g.font = '10px "JetBrains Mono",monospace';
+    g.fillText('m', cx, cy + R * 0.26);
+    const tag = offTagOf(cur);
+    g.fillStyle = tag[1]; g.font = '10px "JetBrains Mono",monospace';
+    g.fillText(tag[0], cx, cy + R * 0.46);
+
+    // 底部：历史范围一句话
+    if (vals.length > 1) {
+      const mn = Math.min(...vals), mx = Math.max(...vals), md = median(vals);
+      g.fillStyle = '#5b7a8c'; g.font = '9.5px "JetBrains Mono",monospace'; g.textAlign = 'left';
+      g.fillText('窗口 ' + Math.round((vals.length - 1) * 5 / 60) + ' min · 中位 ' + md.toFixed(1)
+        + ' / 峰 ' + mx.toFixed(1), 8, h - 5);
+    }
+  }
+
+  /* ---------- B 标尺条 ---------- */
+  function drawOffRuler(g, w, h, vals, cur) {
+    const padL = 10, padR = 10, x0 = padL, x1 = w - padR;
+    const y = Math.round(h * 0.46), bh = Math.max(16, Math.min(30, h * 0.17));
+    const sx = v => x0 + clamp(v, 0, OFF_SCALE) / OFF_SCALE * (x1 - x0);
+
+    // 分区底
+    g.fillStyle = 'rgba(6,12,17,.9)'; g.fillRect(x0, y, x1 - x0, bh);
+    g.fillStyle = 'rgba(47,224,138,.16)'; g.fillRect(sx(0), y, sx(OFF_WARN) - sx(0), bh);
+    g.fillStyle = 'rgba(245,197,66,.16)'; g.fillRect(sx(OFF_WARN), y, sx(OFF_LIMIT) - sx(OFF_WARN), bh);
+    g.fillStyle = 'rgba(255,107,53,.20)'; g.fillRect(sx(OFF_LIMIT), y, sx(OFF_SCALE) - sx(OFF_LIMIT), bh);
+    g.strokeStyle = 'rgba(62,200,230,.16)'; g.lineWidth = 1; g.strokeRect(x0 + .5, y + .5, x1 - x0 - 1, bh - 1);
+
+    // 刻度
+    g.font = '9px "JetBrains Mono",monospace'; g.textAlign = 'center'; g.textBaseline = 'top';
+    [0, 10, 20, 30].forEach(v => {
+      g.strokeStyle = v === OFF_LIMIT ? 'rgba(255,107,53,.85)' : 'rgba(125,170,190,.28)';
+      g.beginPath(); g.moveTo(sx(v), y + bh); g.lineTo(sx(v), y + bh + 4); g.stroke();
+      g.fillStyle = v === OFF_LIMIT ? '#ff9a6b' : '#5b7a8c';
+      g.fillText(String(v), sx(v), y + bh + 6);
+    });
+
+    if (vals.length > 1) {
+      const mn = Math.min(...vals), mx = Math.max(...vals), md = median(vals);
+      // 历史须线
+      g.strokeStyle = 'rgba(62,224,255,.45)'; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(sx(mn), y + bh / 2); g.lineTo(sx(mx), y + bh / 2); g.stroke();
+      [mn, mx].forEach(v => {
+        g.beginPath(); g.moveTo(sx(v), y + bh / 2 - 5); g.lineTo(sx(v), y + bh / 2 + 5); g.stroke();
+      });
+      // 中位刻度
+      g.strokeStyle = 'rgba(230,249,255,.75)'; g.lineWidth = 1.4;
+      g.beginPath(); g.moveTo(sx(md), y + 2); g.lineTo(sx(md), y + bh - 2); g.stroke();
+    }
+
+    if (cur !== null) {
+      const tag = offTagOf(cur);
+      const xc = sx(cur);
+      g.beginPath(); g.moveTo(xc, y - 3); g.lineTo(xc, y + bh + 3);
+      g.strokeStyle = hexA(tag[1], 0.18); g.lineWidth = 6; g.stroke();
+      g.strokeStyle = tag[1]; g.lineWidth = 2; g.stroke();
+      g.beginPath(); g.moveTo(xc, y - 9); g.lineTo(xc - 5, y - 17); g.lineTo(xc + 5, y - 17); g.closePath();
+      g.fillStyle = tag[1]; g.fill();
+    }
+
+    // 左上读数
+    const tag = offTagOf(cur);
+    g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+    g.fillStyle = '#f0fbff'; g.font = 'bold 22px "JetBrains Mono",monospace';
+    g.fillText(cur === null ? '---' : cur.toFixed(1), 10, 24);
+    const tw = cur === null ? 30 : g.measureText(cur.toFixed(1)).width;
+    g.fillStyle = '#7fa2b3'; g.font = '10px "JetBrains Mono",monospace';
+    g.fillText('m', 12 + tw, 24);
+    g.fillStyle = tag[1]; g.font = '10px "JetBrains Mono",monospace';
+    g.fillText(tag[0], 34 + tw, 24);
+    g.textAlign = 'right'; g.fillStyle = '#5b7a8c';
+    g.fillText('限 30 m', x1, 22);
+    if (vals.length > 1) {
+      const mn = Math.min(...vals), mx = Math.max(...vals), md = median(vals);
+      g.textAlign = 'left'; g.fillStyle = '#5b7a8c'; g.font = '9.5px "JetBrains Mono",monospace';
+      g.fillText('中位 ' + md.toFixed(1) + ' · 峰 ' + mx.toFixed(1) + ' · 谷 ' + mn.toFixed(1)
+        + ' · 窗口 ' + Math.round((vals.length - 1) * 5 / 60) + ' min', 10, 40);
+    }
+  }
+
+  /* ---------- C 热条带 ---------- */
+  function drawOffHeat(g, w, h, vals, cur) {
+    const padL = 10, padR = 10, padT = 34, padB = 16;
+    const x0 = padL, x1 = w - padR, y0 = padT, y1 = h - padB;
+    if (y1 - y0 < 16 || x1 - x0 < 40) return;
+    const N = Math.max(16, Math.min(64, Math.round((x1 - x0) / 9)));
+    const bins = new Array(N).fill(-1);
+    // 把历史等分进 N 格，值取该格最大（"这一段最糟到什么程度"）
+    vals.forEach((v, i) => {
+      const k = Math.min(N - 1, Math.floor(i / Math.max(1, vals.length) * N));
+      bins[k] = Math.max(bins[k], v);
+    });
+    const cw = (x1 - x0) / N;
+    const colOf = v => v < OFF_WARN ? '#2fe08a' : v < OFF_LIMIT ? '#f5c542' : '#ff6b35';
+    bins.forEach((v, i) => {
+      const x = x0 + i * cw;
+      g.fillStyle = 'rgba(62,200,230,.05)'; g.fillRect(x + 0.5, y0, cw - 1, y1 - y0);
+      if (v < 0) return;
+      const hh = Math.max(2, (clamp(v, 0, OFF_SCALE) / OFF_SCALE) * (y1 - y0));
+      g.fillStyle = colOf(v);
+      g.globalAlpha = 0.72;
+      g.fillRect(x + 0.5, y1 - hh, cw - 1, hh);
+      g.globalAlpha = 1;
+    });
+    // 30 m 线（量程 36 → 位于 83% 高度处）
+    const yLim = y1 - (OFF_LIMIT / OFF_SCALE) * (y1 - y0);
+    g.strokeStyle = 'rgba(255,107,53,.55)'; g.lineWidth = 1; g.setLineDash([4, 4]);
+    g.beginPath(); g.moveTo(x0, yLim); g.lineTo(x1, yLim); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = '#ff9a6b'; g.font = '9px "JetBrains Mono",monospace';
+    g.textAlign = 'right'; g.textBaseline = 'bottom';
+    g.fillText('30 m', x1, yLim - 2);
+
+    // 顶部读数 + 超 15 m 占比
+    const tag = offTagOf(cur);
+    g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+    g.fillStyle = '#f0fbff'; g.font = 'bold 20px "JetBrains Mono",monospace';
+    g.fillText(cur === null ? '---' : cur.toFixed(1), 10, 22);
+    const tw = cur === null ? 30 : g.measureText(cur.toFixed(1)).width;
+    g.fillStyle = '#7fa2b3'; g.font = '10px "JetBrains Mono",monospace';
+    g.fillText('m', 12 + tw, 22);
+    g.fillStyle = tag[1]; g.fillText(tag[0], 34 + tw, 22);
+    if (vals.length) {
+      const over = vals.filter(v => v >= OFF_WARN).length / vals.length * 100;
+      g.textAlign = 'right'; g.fillStyle = '#5b7a8c';
+      g.fillText('黄区占比 ' + over.toFixed(0) + '% · 近 ' + Math.round((vals.length - 1) * 5 / 60) + ' min',
+        x1, 20);
+    }
+    g.textAlign = 'left'; g.fillStyle = '#3f5c6b'; g.font = '9px "JetBrains Mono",monospace';
+    g.textBaseline = 'top';
+    g.fillText('早', x0, y1 + 3);
+    g.textAlign = 'right'; g.fillText('现在', x1, y1 + 3);
+  }
+
+  /* ---- 07 CUSUM 迷你趋势(页面侧 120 拍 ≈ 10 min;过 H=20 画红虚线) ---- */
+  function drawCusumSpark() {
+    const cv = el('chCusum'); if (!cv) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2), r = cv.getBoundingClientRect();
+    if (r.width < 10) return;
+    if (cv.width !== Math.round(r.width * dpr)) {
+      cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+    }
+    const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = r.width, h = r.height;
+    g.clearRect(0, 0, w, h);
+    if (cusumHist.length < 2) return;
+    const maxV = Math.max(4, ...cusumHist);
+    g.strokeStyle = 'rgba(62,200,230,.15)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, h - 1); g.lineTo(w, h - 1); g.stroke();
+    if (maxV > 20) {
+      const y = h - 2 - 20 / maxV * (h - 4);
+      g.setLineDash([3, 3]); g.strokeStyle = 'rgba(255,107,53,.5)';
+      g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); g.setLineDash([]);
+    }
+    g.beginPath();
+    cusumHist.forEach((v, i) => {
+      const x = i / (cusumHist.length - 1) * w, y = h - 2 - v / maxV * (h - 4);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.strokeStyle = cusumHist[cusumHist.length - 1] >= 20 ? COL.warn : hexA(COL.cyan, .85);
+    g.lineWidth = 1.4; g.stroke();
+  }
+
+  /* =========================================================
+     4. 面板渲染
+  ========================================================= */
+  const el = id => document.getElementById(id);
+
+  /* =========================================================
+     4.5 算法图 —— S3 CHARTS 页四张卡的大屏版
+     ---------------------------------------------------------
+     数据同源：① 用 SKY 的逐星 C/N0；② 用 SKY 按星座现算中位
+     （板上也是 medianOf(talker)，不是另起一套算法）；
+     ③④ 用 OBS / STA。
+     ⚠ CUSUM、VPL、σ 目前**不在 UDP 包里** —— 板上算了但没发。
+       要显示得给 STA 包扩字段（固件侧），页面先按"待固件"占位，
+       不拿别的量假装是它。
+  ========================================================= */
+  const TRD2 = 120;                                  // 与板上 TRD_N 同拍数
+  // ★ 键名必须与 applySats 里 SYS_OF 映射出来的值一致（GPS/BDS/GAL/GLO）——
+  //   用单字母 'G'/'B' 的话 indexOf 永远 -1，趋势图会永远"等待历史积累"。
+  const trd = { GPS: [], BDS: [], GAL: [], GLO: [] };
+  const SYS_KEY = ['GPS', 'BDS', 'GAL', 'GLO'];
+  const AL_M = 30;                                   // 告警限（与固件 alertM 同值）
+
+  function median(a) {
+    if (!a.length) return 0;
+    const s = a.slice().sort((x, y) => x - y);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  function pushTrend() {
+    SYS_KEY.forEach(k => {
+      const v = median(sats.filter(s => s.sys === k && s.snr > 0).map(s => s.snr));
+      const arr = trd[k];
+      arr.push(v > 0 ? Math.round(v) : 0);           // 0 = 这一拍没这颗星的数据
+      if (arr.length > TRD2) arr.shift();
+    });
+  }
+
+  /* ---- 视图切换（★ v5 已删：单页交付，无 tab、无 #alg 深链）---- */
+
+  /* ---- canvas 尺寸（DPR 自适应；隐藏时返回 null）---- */
+  function prep(cv) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    /* ★ v14 卡顿治理：原来每次都 getBoundingClientRect()。poll 里 buildTable/updateAlg
+       刚改过 DOM，这一下会把整页布局同步结算一次（而且 drawTrend / drawOffViz /
+       drawCusumSpark 各来一次）。尺寸只在布局变化时变，改由 cvEpoch 驱动缓存：
+       resize / 拖拽面板时 ++，其余时刻零测量。 */
+    let w = cv.__w, h = cv.__h;
+    if (cv.__ep !== cvEpoch) {
+      const r = cv.getBoundingClientRect();
+      w = Math.round(r.width); h = Math.round(r.height);
+      if (w >= 30 && h >= 30) {            // ★ 只有量到"能用"的尺寸才缓存 ——
+        cv.__w = w; cv.__h = h;            //   面板刚建/还没排版的瞬间量到 0 就缓存住，
+        cv.__ep = cvEpoch;                 //   画布会永远停在默认 300x150 空白(v14 首版踩过)
+      } else {
+        cv.__ep = -1;                      // 下一次调用强制重测
+      }
+    }
+    if (w < 30 || h < 30) return null;
+    /* ★ v15：加 2 px 迟滞。亚像素抖动（±1 px）也会让整块画布重新分配后备存储 +
+       重传 GPU 纹理，是"偶发单帧顿一下"的常见来源；差到 2 px 才真正改尺寸。 */
+    const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (!cv.__sz || Math.abs(cv.width - pw) >= 2 || Math.abs(cv.height - ph) >= 2) {
+      cv.width = pw; cv.height = ph; cv.__sz = 1;
+    }
+    const g = cv.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    return { g: g, w: w, h: h };
+  }
+
+  /* ---- ① 每星 C/N0 竖条（★ v5 已删：算法页下线，逐星 C/N0 由天球两侧光幕承载）---- */
+
+  /* ---- ② C/N0 中位趋势（两条线，断点不连假线 —— 与板上 drawTrendOne 同规矩）----
+     ★ v4 起画布在总览 06 面板。 ---- */
+  function drawTrend() {
+    const cv = el('chTrd');
+    if (!cv) return;
+    const c = prep(cv); if (!c) return;
+    const g = c.g, w = c.w, h = c.h;
+
+    const padL = 32, padR = 50, padT = 12, padB = 18;
+    const baseY = h - padB, maxH = baseY - padT;
+    const V0 = 15, V1 = 50;
+    const yOf = v => baseY - (clamp(v, V0, V1) - V0) / (V1 - V0) * maxH;
+
+    g.font = '10.5px "JetBrains Mono",monospace';
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    [15, 25, 40, 50].forEach(v => {
+      const y = yOf(v), thr = (v === 25), ref = (v === 40);
+      g.beginPath(); g.moveTo(padL, y); g.lineTo(w - padR, y);
+      g.strokeStyle = thr ? 'rgba(255,107,53,.6)'
+                    : ref ? 'rgba(62,200,230,.22)' : 'rgba(62,200,230,.10)';
+      g.lineWidth = 1; g.stroke();
+      g.fillStyle = thr ? '#ff6b35' : '#6d93a5';
+      g.fillText(String(v), padL - 6, y);
+    });
+
+    const x0 = padL, wd = w - padL - padR;
+    const has = SYS_KEY.some(k => trd[k].some(v => v > 0));
+    if (!has) {
+      g.fillStyle = '#3f5c6b'; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.font = '13px "JetBrains Mono",monospace';
+      g.fillText('等待历史积累…', w / 2, h / 2);
+      return;
+    }
+
+    /* ★ v15.5：右端实时值标签固定行位 —— 旧版 y 跟着曲线端点走，GPS/BDS 两条线
+       靠得近时标签互相重叠。现在统一排在右侧留白带里，从上往下每行 15px，
+       位置只取决于"第几个有数据的星座"，与数值无关，永远不会叠在一起；
+       颜色对应曲线，数值照旧实时刷新。 */
+    const tags = [];
+    SYS_KEY.forEach(k => {
+      const arr = trd[k];
+      if (!arr.some(v => v > 0)) return;
+      const col = SYS[k].color;
+      const off = TRD2 - arr.length;              // 未满 120 拍时右对齐：最新一拍贴右缘
+      let started = false, lastV = 0;
+      g.beginPath();
+      arr.forEach((v, i) => {
+        if (v <= 0) { started = false; return; }     // 这一拍没数据 -> 断开
+        const x = x0 + (i + off) / (TRD2 - 1) * wd, y = yOf(v);
+        started ? g.lineTo(x, y) : g.moveTo(x, y);
+        started = true; lastV = v;
+      });
+      g.save();
+      g.strokeStyle = hexA(col, 0.16); g.lineWidth = 4.5; g.lineJoin = 'round';
+      g.stroke();                                  // 粗淡底当辉光（替代 shadowBlur，软件渲染下便宜得多）
+      g.strokeStyle = col; g.lineWidth = 1.7;
+      g.stroke();
+      g.restore();
+
+      if (lastV > 0) tags.push({ label: SYS[k].label, v: lastV, col, yLine: yOf(lastV) });
+    });
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.font = '11px "JetBrains Mono",monospace';
+    tags.forEach((tg, i) => {
+      const ty = padT + 9 + i * 15;                // ★ 固定行位
+      g.fillStyle = hexA(tg.col, 0.95);
+      g.fillText(tg.label + ' ' + tg.v, w - padR + 4, ty);
+    });
+  }
+
+  /* ---- 数值变化闪一下："数据在流"看得见 ----
+     ★ v14 卡顿治理：旧实现是 `removeClass → 读 offsetWidth → addClass`。
+       读 offsetWidth 会**强制浏览器立刻结算布局**，而这一步发生在 poll 里
+       刚改完 16 行表格之后 —— 每 2 秒一次同步布局，正是"每隔几秒卡一下"的
+       典型形态。改成 Web Animations：不读几何、不重排，只重绘这几个字。
+       颜色从缓存的基准色回到自身，不再用 text-shadow（模糊每帧都要重算）。 */
+  function setNum(id, txt) {
+    const e = el(id);
+    if (!e || e.textContent === txt) return;
+    e.textContent = txt;
+    if (!e.__baseCol) e.__baseCol = getComputedStyle(e).color;
+    if (e.animate) {
+      e.animate([{ color: '#f2feff' }, { color: e.__baseCol }],
+                { duration: 700, easing: 'ease-out' });
+    }
+  }
+
+  /* ---- ③④ 完好性 / 检测器 ----
+     ★ v4 起这批 id 全在总览 07 面板（算法页副本已删），每轮 poll 都更新，不看视图。
+     mpTxt 换成能塞进 detgrid 小格的短格式；slowTag/mpDetail/fixTxt 随旧版式退役，
+     留存在性保护防旧缓存/手改 DOM 时抛错。 ---- */
+  function updateAlg() {
+    if (!live) return;                                 // 首帧 poll 还没回来
+    const k = live.kpi;
+    const hasHpl = (k.hpl !== undefined && k.hpl >= 0);
+    const hasOff = !(k.off < 0 && (k.tag === 'NO-BASE' || k.tag === 'NO-DATA'));
+
+    el('alTxt').textContent = 'AL ' + AL_M + ' m';
+    setNum('hplTxt', 'HPL ' + (hasHpl ? k.hpl.toFixed(1) + ' m' : '---'));
+    /* ★ v15.4：VPL/VDOP/σ 三个占位符从包里就没有数据、永远显示 "---"，
+       却各占一行把 CUSUM 挤出面板底边（实测内容比面板高 63 px）。删除。 */
+
+    const fill = el('hplFill');
+    const frac = hasHpl ? clamp(k.hpl / (2 * AL_M), 0, 1) : 0;   // 量程 0..2AL，AL 在正中
+    fill.style.width = (frac * 100).toFixed(1) + '%';
+    const over = hasHpl && k.hpl > AL_M;
+    // ★ v14:与板上 INTEGRITY 条同语言 —— 0.5~1×AL 琥珀预警,>1×AL 红/紫
+    fill.classList.toggle('bad', over);
+    fill.classList.toggle('warn', !over && hasHpl && k.hpl >= 0.5 * AL_M);
+
+    setNum('offTxt', 'OFF ' + (hasOff ? k.off.toFixed(1) + ' m' : '---'));
+    el('limTxt').textContent = 'LIM ' + AL_M + ' m';
+
+    const tag = k.tag || '---';
+    const sb = el('stateBig');
+    if (sb.textContent !== tag) { sb.textContent = tag; }
+    sb.classList.toggle('bad', ['POS-BAD', 'LOST', 'SIG-BAD', 'HPL-HIGH'].indexOf(tag) >= 0);
+    sb.classList.toggle('warn', ['DRIFT', 'STEP'].indexOf(tag) >= 0);
+
+    el('dopTxt').textContent =
+      'HDOP ' + (k.hdop >= 0 ? k.hdop.toFixed(2) : '--') +
+      ' · 卫星 ' +
+      (k.sats_used >= 0 ? k.sats_used : '--') + '/' + (k.sats_view >= 0 ? k.sats_view : '--');
+
+    const mpn = k.mpn, mppk = k.mppk;
+    setNum('mpTxt', mpn > 0
+      ? 'MP n' + mpn + (mppk >= 0 && mppk > 0 ? ' +' + mppk.toFixed(1) + 'dB' : '')
+      : 'MP none');
+    const st = el('slowTag');
+    if (st) {                                          // 旧版式元素，v4 已不在 DOM
+      st.textContent = mpn > 0 ? '有多径' : 'OK';
+      st.className = 'sub2 ' + (mpn > 0 ? 'orange' : 'green');
+    }
+
+    el('tempTxt').textContent = k.temp >= 0 ? k.temp.toFixed(1) + ' ℃' : '--';
+    el('rhTxt').textContent = k.rh >= 0 ? k.rh.toFixed(0) + ' %' : '--';
+    // ★ v1.14.9:CUSUM 上屏(固件 STA 尾插列)。旧固件没有这列 → k.cusum=-1,显"待 v1.14.9"。
+    //   SQW-PPS 小格删除(与 01 KPI / 04 双联表三重重复,按去重结论退场)。
+    //   ★ v1.14.12:量程 0..3H(与板上 DETECTORS 条同刻度,H 刻度 = 1/3 处);
+    //     gated=1 时补一个"闸下"角标 —— 说明统计量正被绝对闸拦着,数字大小不构成判决。
+    const cs = k.cusum, cslow = k.slow === 1, cgated = k.gated === 1;
+    el('cusumTxt').textContent = cs < 0 ? '待 v1.14.10 固件'
+      : cs.toFixed(1) + ' / 60.0' + (cgated ? ' ·闸下' : '');
+    el('cusumTxt').style.color = cslow ? COL.warn : (cgated ? '#54798a' : '');
+    el('cusumBar').style.width = (cs < 0 ? 0 : clamp(cs / 60 * 100, 0, 100)) + '%';
+    el('cusumBar').style.background = cslow ? COL.warn : (cgated ? 'rgba(62,200,230,.35)' : '');
+    el('cusumBar').style.boxShadow = cslow ? '0 0 6px rgba(255,107,53,.6)' : '';
+    if (cs >= 0) {
+      cusumHist.push(cs);
+      if (cusumHist.length > 120) cusumHist.shift();   // ≈ 最近 10 min(5 s 一拍)
+    }
+    drawCusumSpark();
+    el('tsrcTxt').textContent = k.tsrc === 'G' ? 'GNSS' : (k.tsrc === 'R' ? 'RTC 备用' : '--');
+    const fx = el('fixTxt');
+    if (fx) fx.textContent = (k.sats_used >= 0 ? k.sats_used : '--') + ' / ' +
+      (k.sats_view >= 0 ? k.sats_view : '--');        // v4 起 fix/used 与 01 面板重复，格位让给 CUSUM
+  }
+
+  /* ★ 卡顿治理：原实现每 2 秒 innerHTML 重建整张表（16 行 × 5 格 = 80 个节点 + 样式重算），
+     再叠加下一帧的强制布局，一卡就是几十毫秒。改成建一次、之后只改文本和宽度。 */
+  /* ★ v15：写 DOM 前先比值。给 textContent 赋同一个字符串也会重建文本节点、
+     把布局标脏；轮询每 2 s 一次，80 个格子全标脏就会在下一帧多出一次全表重排。 */
+  function setTxt(node, txt) {
+    if (node.__t === txt) return;
+    node.__t = txt; node.textContent = txt;
+  }
+  function setHtml(node, html) {
+    if (node.__h === html) return;
+    node.__h = html; node.innerHTML = html;
+  }
+  function setStyle(node, prop, val) {
+    const k = '__s_' + prop;
+    if (node[k] === val) return;
+    node[k] = val; node.style[prop] = val;
+  }
+
+  const tblRows = [];
+  function buildTable() {
+    const rows = sats.slice().sort((a, b) => b.snr - a.snr).slice(0, 16);
+    const body = el('satBody');
+    if (!body) return;
+    while (tblRows.length < rows.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td><span class="dot"></span><span class="prn"></span></td>' +
+                     '<td><span class="snrbar"><i></i></span><span class="snrv"></span></td>' +
+                     '<td class="cel"></td><td class="caz"></td><td class="cst"></td>';
+      body.appendChild(tr);
+      tblRows.push({
+        tr, dot: tr.querySelector('.dot'), prn: tr.querySelector('.prn'),
+        bar: tr.querySelector('.snrbar i'), snrv: tr.querySelector('.snrv'),
+        cel: tr.querySelector('.cel'), caz: tr.querySelector('.caz'), cst: tr.querySelector('.cst')
+      });
+    }
+    while (tblRows.length > rows.length) body.removeChild(tblRows.pop().tr);
+    rows.forEach((s, i) => {
+      const r = tblRows[i];
+      const bad = !s.ok || s.snr < 24;
+      const w = clamp((s.snr - 15) / 35 * 100, 4, 100);
+      if (r.tr.dataset.id !== String(s.id)) r.tr.dataset.id = s.id;
+      const col = SYS[s.sys].color;
+      setStyle(r.dot, 'background', col);
+      setStyle(r.dot, 'boxShadow', '0 0 6px ' + col);
+      setTxt(r.prn, s.prn);
+      setStyle(r.bar, 'width', w.toFixed(0) + '%');
+      if (r.bar.className !== (bad ? 'low' : '')) r.bar.className = bad ? 'low' : '';
+      setTxt(r.snrv, s.snr.toFixed(0));
+      setTxt(r.cel, s.el.toFixed(0) + '°');
+      setTxt(r.caz, s.az.toFixed(0) + '°');
+      const st = 'st ' + (bad ? 'bad' : 'good');
+      if (r.cst.className !== st) r.cst.className = st;
+      setTxt(r.cst, bad ? 'WEAK' : 'OK');
+    });
+  }
+
+  function buildLegend() {
+    // ★ 2026-10-31 v4：S3 提速 115200 后 B 星 GSV 已带真实 az/el（B01/02/03…全上图），
+    //   原"BDS 恒灰：GSV 不报 az/el"的注释与置灰逻辑作废，四星座统一正常显示。
+    el('legend').innerHTML = Object.keys(SYS).map(k =>
+      '<span><i style="background:' + SYS[k].color + ';box-shadow:0 0 6px ' + SYS[k].color + '"></i>' +
+      SYS[k].label + '</span>').join('');
+  }
+
+  const logs = [];
+  function pushLog(kind, msg, level) {
+    const d = new Date();
+    logs.unshift({
+      t: pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds()),
+      k: kind, m: msg, lv: level || 'info'
+    });
+    if (logs.length > 60) logs.pop();
+    renderLog();
+  }
+  function renderLog() {
+    if (!logs.length) {     // ★ 空态：明确告诉观众"不是断流，是真没事件"
+      el('log').innerHTML = '<div class="logrow empty"><span class="k">—</span>' +
+        '<span class="m">暂无事件记录 · 链路与完好性均正常</span></div>';
+      return;
+    }
+    el('log').innerHTML = logs.slice(0, 40).map(r =>
+      '<div class="logrow ' + (r.lv === 'alarm' ? 'alarm' : r.lv === 'warn' ? 'warn' : '') + '">' +
+      '<span class="t">' + r.t + '</span><span class="k">' + r.k + '</span>' +
+      '<span class="m">' + r.m + '</span></div>'
+    ).join('');
+  }
+
+  /* =========================================================
+     5. 数据接入（2 s 轮询 /api/live；页面不自己推进任何数据）
+  ========================================================= */
+  function qualText(q) {
+    if (q === 1) return 'SINGLE';
+    if (q === 2) return 'DGPS';
+    if (q === 4) return 'RTK FIXED';
+    if (q === 5) return 'RTK FLOAT';
+    if (q === 6) return 'ESTIMATED';
+    return 'NO FIX';
+  }
+
+  function applySats() {
+    const prev = new Map(sats.map(s => [s.prn, s]));
+    sats.length = 0;
+    (live.sky || []).forEach((p, i) => {
+      const sys = SYS_OF[p.sys];
+      if (!sys) return;
+      const old = prev.get(p.prn);
+      sats.push({
+        id: i + 1, sys: sys, prn: p.prn,
+        az: p.az, el: p.el, snr: p.cn0 > 0 ? p.cn0 : 0,
+        phase: old ? old.phase : (i * 0.7),
+        born: old ? old.born : performance.now(),   // ★ 新星渐入动画用
+        ok: p.cn0 >= 24
+      });
+    });
+    pushTrend();                       // 每轮把各星座中位塞进趋势缓冲
+    sonFeed(sats);                     // ★ v16：点选声化的数据源（跨轮合并，12 s 才退场）
+  }
+
+  function applySeries() {
+    const obs = live.obs || [];
+    const off = [];
+    obs.forEach(o => {
+      if (!(o.off === -1 && live.kpi.off < 0)) off.push(o.off);
+    });
+    offLong.length = 0;
+    off.slice(-HIST).forEach(v => offLong.push(v));
+    alarmCounts = live.alarm_bins || alarmCounts;
+    (live.snr_bins || []).forEach((v, i) => { if (i < 6) snrBins[i] = v; });
+
+    // ★ 2026-10-30: SQW−PPS 相位差的**绝对值没有意义**（取决于上次校准时怎么对齐，
+    //   见固件 OBS 第 15 列注释），有信息的是它的**斜率** = 两把表的频率差。
+    //   取最近 60 拍（≈5 min）做一元线性回归，斜率 ms/s ×1000 = ppm。
+    //   注意 x 必须先减去首点时间：Unix 秒平方会到 3e18，double 只有 15~16 位有效数字，
+    //   直接代入会灾难性抵消，算出垃圾值。
+    phasePpm = (() => {
+      const pts = obs.filter(o => o.pps > -0.99 && o.t > 0).slice(-60);
+      if (pts.length < 6) return null;
+      const n = pts.length, t0 = pts[0].t;
+      let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      pts.forEach(o => {
+        const x = o.t - t0, y = o.pps;
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+      });
+      const den = n * sxx - sx * sx;
+      if (!den) return null;
+      return ((n * sxy - sx * sy) / den) * 1000;   // ms/s → ppm
+    })();
+  }
+
+  function setLink(link) {
+    const on = link.state === 'ok', warn = link.state === 'warn';
+    el('link').textContent = on ? 'ONLINE' : (warn ? 'DELAY' : 'OFFLINE');
+    el('link').className = 'val ' + (on ? 'ok' : warn ? 'warn' : 'bad');
+    document.body.classList.toggle('stale', !on);
+  }
+
+  function pushEventRows() {
+    const evs = live.events || [];
+    const sig = evs.map(e => e.seq + ':' + e.closed).join(',');
+    const gapSum = Object.values(live.link.gaps || {}).reduce((a, b) => a + b, 0);
+    if (sig !== lastEvtSig) {
+      lastEvtSig = sig;
+      logs.length = 0;
+      evs.slice(0, 40).forEach(e => {
+        const closed = e.closed === 1;
+        const msg = closed
+          ? '恢复 · 持续 ' + e.dur + ' s' + (e.cross ? '（跨 UTC 零点）' : '')
+          : '开始 · off ' + e.off.toFixed(1) + ' m · ' + (e.cause || '---');
+        logs.push({ t: e.t0 || '--:--:--', k: e.type, m: msg, lv: closed ? 'info' : 'alarm' });
+      });
+      renderLog();
+    }
+    if (gapSum > lastGapSum) {
+      lastGapSum = gapSum;
+      pushLog('GAP', 'UDP 序号有洞（累计 ' + gapSum + '）· 板上 /obs.csv 仍是正本', 'warn');
+    }
+  }
+
+  function renderAll() {
+    const k = live.kpi;
+    // ★ 2026-10-30 晚:传输方式上 HUD —— 板子可以 UDP/TCP 两种，看板上必须一眼可辨，
+    //   否则"到底是 TCP 在兜底还是还走着会丢包的 UDP"看不出来。
+    const tp = ((live.link && live.link.transport) || 'udp').toUpperCase();
+    setHtml(el('chipLink'), 'W1 · ' + tp + ' <b>9911</b>');
+    setStyle(el('chipLink'), 'color', tp === 'TCP' ? COL.cyan : '');
+    const offOk = !(k.off < 0 && (k.tag === 'NO-BASE' || k.tag === 'NO-DATA'));
+    const off = offOk ? k.off : 0;
+
+    // ★ 判据改斜率：相位绝对值是"上次校准怎么对齐"的产物（331 ms 完全合法），
+    //   拿 |pps|>1 判警会永远红着。真正异常的是频差（斜率）跑飞。
+    //   ★ 2026-10-31：数值只在 04 脉冲对比带里显示，KPI 不再重复。
+    const ppsBad = phasePpm !== null && Math.abs(phasePpm) > PPS_LIMIT;
+    const offBad = offOk && off > OFF_LIMIT;
+
+    // ★ 局部名原来叫 view，和视图切换的全局 view 撞名（遮蔽导致算法图永不刷新），改名 sview
+    const used = k.sats_used, sview = k.sats_view;
+    setHtml(el('kSat'), (used >= 0 ? used : '--') + '<span class="unit">/ ' + (sview >= 0 ? sview : '--') + '</span>');
+    setStyle(el('satBar'), 'width', (used >= 0 && sview > 0 ? clamp(used / sview * 100, 5, 100) : 5) + '%');
+
+    setTxt(el('kFix'), qualText(k.qual));
+
+    setHtml(el('kOff'), (offOk ? off.toFixed(1) : '---') + '<span class="unit">m</span>');
+    el('kOff').classList.toggle('warn', offBad);
+    el('offTag').textContent = offBad ? 'ALERT' : 'NOMINAL';
+    el('offTag').classList.toggle('bad', offBad);
+
+    el('ovTracked').textContent = sats.length;
+    const cn0v = sats.map(s => s.snr).filter(v => v > 0).sort((a, b) => a - b);
+    el('aurMed').textContent = cn0v.length ? cn0v[Math.floor(cn0v.length / 2)] : '--';
+    el('ovHdop').textContent = k.hdop >= 0 ? k.hdop.toFixed(2) : '--';
+
+    const alarmTag = ['POS-BAD', 'LOST', 'SIG-BAD', 'DRIFT', 'HPL-HIGH'].indexOf(k.tag) >= 0;
+    const anyAlarm = ppsBad || offBad || alarmTag;
+    el('lamp').classList.toggle('on', anyAlarm);
+    el('alarmText').textContent = anyAlarm ? 'ALERT' : 'NOMINAL';
+    el('alarmText').classList.toggle('bad', anyAlarm);
+
+    buildTable();
+
+    if (typeof Chart !== 'undefined') {
+      /* ★ 卡顿治理：这两个柱状图的数据（12 小时告警桶 / 6 档信噪比桶）变化很慢，
+         但原来每 2 秒无条件 update() 两次。Chart.js 的 update 即使 'none' 也要重算
+         全部元素几何，是 poll 里最贵的一步。数据没变就不碰它。 */
+      const aSig = alarmCounts.join(',');
+      if (charts.alarmBar.$sig !== aSig) {
+        charts.alarmBar.$sig = aSig;
+        charts.alarmBar.data.datasets[0].data = alarmCounts.slice();
+        charts.alarmBar.data.datasets[0].backgroundColor =
+          alarmCounts.map(v => (v >= 4 ? 'rgba(255,107,53,.55)' : 'rgba(62,224,255,.32)'));
+        charts.alarmBar.update('none');
+      }
+
+      const sSig = snrBins.join(',');
+      if (charts.snrBar.$sig !== sSig) {
+        charts.snrBar.$sig = sSig;
+        charts.snrBar.data.datasets[0].data = snrBins.slice();
+        charts.snrBar.update('none');
+      }
+    }
+
+    // ★ v4/v5：中位趋势与完好性/检测器在总览，每轮必刷；算法页已删
+    drawTrend();
+    updateAlg();
+    drawOffViz();                          // ★ v8:05 三种画法（数据到了就重绘）
+  }
+
+  let polling = false;
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    const t0 = performance.now();
+    try {
+      const r = await fetch('/api/live', { cache: 'no-store' });
+      if (!r.ok) throw new Error('http ' + r.status);
+      live = await r.json();
+      applySats();
+      applySeries();
+      pushEventRows();
+      setLink(live.link);
+      renderAll();
+      lastRx = performance.now();
+    } catch (e) {
+      setLink({ state: 'down' });
+    } finally {
+      polling = false;
+      if (DIAG) dgPoll = performance.now() - t0;
+    }
+  }
+
+  /* =========================================================
+     7. 面板布局引擎（v8）：12 列 × 24 行虚拟网格
+        · 编辑模式：拖标题栏移动、拖右下角缩放，落点自动对齐网格
+        · 冲突时其余面板自动下推，随后整体上压实（贴边）
+        · 布局存 localStorage；"原版/天球满高/天球全高"三个预设一键切
+     ========================================================= */
+  const LAY = {
+    cols: 12, rows: 24, gap: 8, pad: 8, edit: false,
+    items: [], cell: { cw: 100, ch: 30, gap: 8 },
+    name: 'dome',
+    stageW: 0, stageH: 0,          // 画布尺寸（首次打开时记录，之后锁死）
+    presets: {
+      v4: {
+        '01': [0, 0, 3, 12], '08': [0, 12, 3, 5], '04': [0, 17, 3, 7], '02': [3, 0, 6, 15],
+        '03': [9, 0, 3, 15], '05': [3, 15, 3, 9], '06': [6, 15, 3, 9], '07': [9, 15, 3, 9]
+      },
+      // ★ v15.5 行分配微调：03 加 1 行（底部统计图不再裁切）、05 减 1 行（画布自适应）；
+      //   02 略压高、06 相应加高（趋势曲线更舒展）；02 圆直径受面板宽度限制，压高不缩圆。
+      dome: {
+        '01': [0, 0, 3, 10], '08': [0, 10, 3, 5], '04': [0, 15, 3, 9],
+        '02': [3, 0, 6, 17], '06': [3, 17, 6, 7],
+        '03': [9, 0, 3, 11], '07': [9, 11, 3, 8], '05': [9, 19, 3, 5]
+      },
+      // 02 真正从头到底；06/08 进左列，05 进右列
+      dome2: {
+        '01': [0, 0, 3, 9], '04': [0, 9, 3, 7], '06': [0, 16, 3, 4], '08': [0, 20, 3, 4],
+        '02': [3, 0, 6, 24],
+        '03': [9, 0, 3, 9], '05': [9, 9, 3, 8], '07': [9, 17, 3, 7]
+      }
+    }
+  };
+  /* ★ v13：旧存档里没有 08 声化 —— 新面板的初始落点（锚在左列，把上方面板压短让位） */
+  const LAY_NEW = { '08': [0, 12, 3, 6] };
+
+  const layBox = () => document.getElementById('layoutOv');
+  const layOverlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+  function layFlush() {
+    const box = layBox(); if (!box) return;
+    const gap = LAY.gap, pad = LAY.pad;
+    const W = box.clientWidth - pad * 2, H = box.clientHeight - pad * 2;
+    /* ★ 2026-10-31 v10：行数固定 24，绝不再随面板膨胀。
+       旧版 rows = max(24, 最底边)，只要有一块被拉高，rows 变大 → 行高 ch 变矮 →
+       同一个像素高度折算成更多行 → 正反馈，最后全页面板一起重算尺寸（用户看到的
+       "我调 04，02/06 跟着动" 就是这么来的）。 */
+    const rows = LAY.rows;
+    const cw = (W - gap * (LAY.cols - 1)) / LAY.cols;
+    const ch = (H - gap * (rows - 1)) / rows;
+    LAY.cell = { cw, ch, gap, pad };
+    LAY.items.forEach(it => {
+      it.el.style.left = (pad + it.x * (cw + gap)) + 'px';
+      it.el.style.top = (pad + it.y * (ch + gap)) + 'px';
+      it.el.style.width = (it.w * cw + (it.w - 1) * gap) + 'px';
+      it.el.style.height = (it.h * ch + (it.h - 1) * gap) + 'px';
+    });
+  }
+
+  /* 列组：水平方向有交叠的面板才互相影响（同列上下邻居，或横向跨列后形成的连通块）。
+     没有水平交叠的列组之间完全独立 —— 这是"改一列的高度不牵动别的列"的结构保证。 */
+  function layGroup(it) {
+    const set = new Set([it]);
+    const stack = [it];
+    while (stack.length) {
+      const a = stack.pop();
+      LAY.items.forEach(o => {
+        if (!set.has(o) && o.x < a.x + a.w && a.x < o.x + o.w) { set.add(o); stack.push(o); }
+      });
+    }
+    return Array.from(set);
+  }
+
+  /* 旧存档迁移：历史版本里 rows 被拖乱（存档出现 137/139 这种行数），
+     加载时按"每列组自身总高"等比归一化回 24 行，并顺序贴边，
+     避免一打开就是失比例的状态。 */
+  function layNormalize() {
+    const seen = new Set();
+    LAY.items.forEach(start => {
+      if (seen.has(start)) return;
+      const group = layGroup(start);
+      group.forEach(o => seen.add(o));
+      const sorted = group.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+      const total = Math.max.apply(null, sorted.map(o => o.y + o.h).concat([1]));
+      if (total <= LAY.rows + 0.5) return;            // 本来就在 24 行内，原样保留
+      let acc = 0;
+      sorted.forEach(o => {
+        const h = Math.max(3, Math.round(o.h / total * LAY.rows));
+        o.y = acc; o.h = h; acc += h;
+      });
+      for (let i = sorted.length - 1; i >= 0 && acc > LAY.rows; i--) {   // 超出的从最底部压
+        const cut = Math.min(sorted[i].h - 3, acc - LAY.rows);
+        if (cut > 0) { sorted[i].h -= cut; acc -= cut; }
+      }
+    });
+  }
+
+  /* 只在列组内解重叠（不做上压实）：用于加载存档，保留用户自己留的间距 */
+  function layGuard(main) {
+    const placed = [main];
+    layGroup(main).filter(o => o !== main).sort((a, b) => a.y - b.y || a.x - b.x).forEach(it => {
+      let guard = 0;
+      while (placed.some(p => layOverlap(it, p)) && guard++ < 200) it.y++;
+      placed.push(it);
+    });
+  }
+
+  /* 列组内：先下推让位，再上压实贴边；越界时从底往上重排整列（拉高一块 → 上面的块相应变矮，
+     顺序绝不交换）。全程只碰同列组，别的列一根手指都不动。 */
+  function laySettle(moved) {
+    moved.x = clamp(moved.x, 0, LAY.cols - moved.w);
+    moved.h = clamp(moved.h, 3, LAY.rows);
+    moved.y = Math.max(0, moved.y);          // 底边暂不夹 —— 越界由第 ③ 步整列重排处理
+
+    const group = layGroup(moved);
+    const placed = [moved];
+    group.filter(o => o !== moved).sort((a, b) => a.y - b.y || a.x - b.x).forEach(it => {
+      let guard = 0;
+      while (placed.some(p => layOverlap(it, p)) && guard++ < 200) it.y++;
+      placed.push(it);
+    });
+
+    const fixed = [];
+    group.slice().sort((a, b) => a.y - b.y || a.x - b.x).forEach(it => {
+      let guard = 0;
+      while (it.y > 0 && guard++ < 200) {
+        const t = { x: it.x, y: it.y - 1, w: it.w, h: it.h };
+        if (fixed.some(p => layOverlap(t, p))) break;
+        it.y--;
+      }
+      fixed.push(it);
+    });
+
+    /* ③ 组内有人越界（拖高一块、或拖到列底）：整列按先后顺序重新分配这 24 行。
+       moved 只承担少量压缩，其余先让位 —— 拉高的那块保住高度、邻居相应变矮，顺序不交换。 */
+    if (group.some(o => o.y + o.h > LAY.rows)) {
+      const col = group.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+      const MINH = 3;
+      let need = col.reduce((s, o) => s + o.h, 0) - LAY.rows;
+      if (need > 0) {
+        const others = col.filter(o => o !== moved);
+        const movable = others.reduce((s, o) => s + Math.max(0, o.h - MINH), 0);
+        if (movable > 0) {
+          const take = Math.min(need, movable);
+          others.forEach(o => {
+            const cut = Math.min(Math.max(0, o.h - MINH), Math.round(take * Math.max(0, o.h - MINH) / movable));
+            o.h -= cut;
+          });
+          need = col.reduce((s, o) => s + o.h, 0) - LAY.rows;
+        }
+        if (need > 0) moved.h = Math.max(MINH, moved.h - need);
+      }
+      let acc = 0;
+      col.forEach(o => { o.y = acc; acc += o.h; });
+    }
+  }
+
+  function layApply(pos, name) {
+    pos = pos || {};
+    LAY.name = name || 'free';
+    LAY.items.forEach(it => {
+      const p = pos[it.id];
+      if (p) { it.x = p[0]; it.y = p[1]; it.w = p[2]; it.h = p[3]; }
+    });
+    /* ★ v13：旧存档里没有的新面板（08 声化）—— 给一个锚点，并把"压在它上面"的同列面板
+       按高度压短让位。只动高度、不动别人的位置，是最不打扰已调好版式的加法。 */
+    LAY.items.forEach(it => {
+      if (pos[it.id]) return;
+      const s = LAY_NEW[it.id] || [0, LAY.rows - 4, 3, 4];
+      it.x = s[0]; it.y = s[1]; it.w = s[2]; it.h = s[3];
+      LAY.items.forEach(o => {
+        if (o === it) return;
+        if (!(o.x < it.x + it.w && it.x < o.x + o.w)) return;    // 不同列组：一根手指都不碰
+        if (o.y < it.y && o.y + o.h > it.y) o.h = Math.max(3, it.y - o.y);
+        else if (o.y >= it.y && layOverlap(o, it)) o.y = it.y + it.h;
+      });
+    });
+    layNormalize();                        // 旧存档（行数被拖乱）先归一化回 24 行
+    LAY.items.forEach(it => {
+      it.w = clamp(it.w, 2, LAY.cols);
+      it.h = clamp(it.h, 3, LAY.rows);
+      it.x = clamp(it.x, 0, LAY.cols - it.w);
+      it.y = clamp(it.y, 0, LAY.rows - it.h);
+    });
+    /* 加载时不做"上压实"：你亲手留的间距要保留；只在真出现重叠时同列解一下 */
+    const done = new Set();
+    LAY.items.forEach(it => {
+      if (done.has(it)) return;
+      layGroup(it).forEach(o => done.add(o));
+      layGuard(it);
+    });
+    layFlush();
+    layRefresh();
+  }
+
+  /* ★ v9：布局持久化 —— 本地 localStorage 是"当前浏览器的最新版"，
+     同时 POST 到 /api/layout 存档（换浏览器/清缓存不丢，也方便把定稿布局写死成默认）。 */
+  let layPostTimer = 0;
+  function layPayload() {
+    const pos = {};
+    LAY.items.forEach(it => { pos[it.id] = [it.x, it.y, it.w, it.h]; });
+    return { ver: 2, name: LAY.name, cols: LAY.cols, rows: LAY.rows, gap: LAY.gap, pad: LAY.pad,
+             stage: { w: LAY.stageW, h: LAY.stageH }, pos };
+  }
+
+  function laySave() {
+    const payload = layPayload();
+    try { localStorage.setItem('gnss.layout.v2', JSON.stringify(payload)); } catch (e) {}
+    clearTimeout(layPostTimer);
+    layPostTimer = setTimeout(() => {
+      try {
+        fetch('/api/layout', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                               body: JSON.stringify(payload) }).catch(() => {});
+      } catch (e) {}
+    }, 500);
+  }
+
+  /* 舞台尺寸：第一次打开时把当前窗口尺寸记下来当"画布尺寸"，之后锁死不再跟着窗口变。
+     窗口不会因此出滚动条：body overflow:hidden，Layout 超出部分被裁。 */
+  function layStageInit() {
+    let w = 0, h = 0;
+    try {
+      const s = JSON.parse(localStorage.getItem('gnss.layout.v2') || 'null');
+      if (s && s.stage) { w = s.stage.w | 0; h = s.stage.h | 0; }
+    } catch (e) {}
+    const box = layBox();
+    if (!w || !h) { w = Math.round(box.clientWidth); h = Math.round(box.clientHeight); }
+    LAY.stageW = w; LAY.stageH = h;
+    const rs = document.documentElement.style;
+    rs.setProperty('--stage-w', w + 'px');
+    rs.setProperty('--stage-h', h + 'px');
+  }
+
+  /* ★ v15.5：layPaintBar 已删（顶栏预设/编辑按钮组下线），残留调用一并移除 */
+
+  /* 尺寸变了：重排 + 让所有画布重新量尺寸。
+     ★ v15.4：本体挪进 layRefreshSoon（rAF 去抖），供 resize 事件与 ResizeObserver
+     共用 —— RO 在布局竞态下可能一秒触发多次，不去抖会反复整页重排。 */
+  let layReq = 0;
+  function layRefreshSoon() {
+    if (layReq) return;
+    layReq = requestAnimationFrame(() => {
+      layReq = 0;
+      resize();
+      sonResize();                       // ★ v13：08 声化两块画布跟着版式重新量尺寸
+      Object.keys(charts).forEach(k => { const c = charts[k]; if (c && c.resize) c.resize(); });
+      drawTrend(); drawOffViz(); drawCusumSpark && drawCusumSpark();
+    });
+  }
+  function layRefresh() {
+    layRefreshSoon();
+  }
+
+  function layDragStart(e, it, mode) {
+    if (!LAY.edit) return;
+    e.preventDefault(); e.stopPropagation();
+    const g = LAY.cell;
+    const ox = it.el.offsetLeft, oy = it.el.offsetTop, ow = it.el.offsetWidth, oh = it.el.offsetHeight;
+    const mx0 = e.clientX, my0 = e.clientY;
+    let nx = it.x, ny = it.y, nw = it.w, nh = it.h;
+    it.el.classList.add('dragging');
+    const move = ev => {
+      const dx = ev.clientX - mx0, dy = ev.clientY - my0;
+      if (mode === 'move') {
+        it.el.style.left = (ox + dx) + 'px';
+        it.el.style.top = (oy + dy) + 'px';
+        nx = clamp(Math.round((ox + dx - g.pad) / (g.cw + g.gap)), 0, LAY.cols - it.w);
+        ny = clamp(Math.round((oy + dy - g.pad) / (g.ch + g.gap)), 0, LAY.rows - it.h);
+      } else {
+        const w = Math.max(120, ow + dx), h = Math.max(70, oh + dy);
+        it.el.style.width = w + 'px';
+        it.el.style.height = h + 'px';
+        /* ★ 宽度上限锁在画布内（最多铺到 12 列）；高度允许拉满 24 行，
+           挤出来的空间由同列的邻居"相应变矮"（laySettle 里压缩），不影响其他列 */
+        nw = clamp(Math.round((w + g.gap) / (g.cw + g.gap)), 2, LAY.cols - it.x);
+        nh = clamp(Math.round((h + g.gap) / (g.ch + g.gap)), 3, LAY.rows);
+      }
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      it.el.classList.remove('dragging');
+      if (mode === 'move') { it.x = nx; it.y = ny; } else { it.w = nw; it.h = nh; }
+      it.x = clamp(it.x, 0, LAY.cols - it.w);
+      it.y = Math.max(0, it.y);
+      laySettle(it);
+      layFlush();
+      laySave();
+      layRefresh();
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  /* =========================================================
+     8. C/N0 声化（★ v13）
+        ---------------------------------------------------------
+        同一路 C/N0，两种读法：06 看慢趋势，08 听"当下质量"。
+        · 单声部：中位 / 最强 / 最弱 三选一（12 颗星齐唱会糊成一片）
+        · 量化到音阶 + 迟滞 + 平滑 = 数值抖动不会变成音高乱跳
+        · 好听靠包络与混响，不靠采样率（WebAudio 固定 48 kHz）
+        数据全部来自 sats[]（SKY 包里的逐星 C/N0），页面不造数。
+     ========================================================= */
+  const SON_NOTE = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  const SON_SOLF = ['do','do','re','re','mi','fa','fa','so','so','la','la','si'];
+  const SON_SHARP = [1, 3, 6, 8, 10];
+  const SON_SCALES = {
+    pent:  [0, 2, 4, 7, 9],
+    major: [0, 2, 4, 5, 7, 9, 11],
+    whole: [0, 2, 4, 6, 8, 10]
+  };
+  /* ★ v16 点选声化：在 02 天球星图上点卫星，点谁谁唱。参数只剩 音阶 + 音量。
+     前身 v15.6"合唱"（自动选星、偏离中位音量）听久不舒服，弃用删除。 */
+  const SON = {
+    lo: 15, hi: 45, span: 2, scale: 'pent', timbre: 'bell', vol: 0.45,
+    picked: [],                       // 用户点选的卫星 prn（顺序即点选顺序，最多 10）
+    power: false,
+    lastT: 0, drawAt: 0,
+    kx: null, kw: 0, kh: 0, rx: null, rw: 0, rh: 0
+  };
+
+  /* ---------- 点选声化：映射常量 ----------
+     音高 ← C/N0（15–45 dB-Hz → 2 个八度，量化到所选音阶）；
+     音色亮度 ← C/N0 绝对值（强弱直觉放在音色上，不放音量上）；
+     音量 ← 每声部固定，按声部数功率归一（n 颗齐唱总响度不随 n 涨）；
+     声像 ← 方位角（东在右、西在左，抬头就能对上）。 */
+  const CH_FLOOR = 14;                // 低于此 C/N0 视为无效，不发声
+
+  /* 用户调过的参数要留住（音阶/音量/点选列表，刷新后还原） */
+  (function sonPrefsLoad() {
+    try {
+      const o = JSON.parse(localStorage.getItem('gnss.sonify.v1') || 'null');
+      if (!o || typeof o !== 'object') return;
+      if (o.scale != null) SON.scale = o.scale;
+      if (o.timbre != null) SON.timbre = o.timbre;
+      if (typeof o.vol === 'number') SON.vol = o.vol;
+      if (Array.isArray(o.picked)) SON.picked = o.picked.filter(x => typeof x === 'string');
+    } catch (e) {}
+  })();
+
+  function sonSavePrefs() {
+    try {
+      localStorage.setItem('gnss.sonify.v1', JSON.stringify({
+        scale: SON.scale, timbre: SON.timbre, vol: SON.vol, picked: SON.picked
+      }));
+    } catch (e) {}
+  }
+
+  /* ---------- 映射：C/N0 → MIDI（15–45 dB-Hz → 2 个八度，48 = C3）---------- */
+  function sonMidiOf(v) {
+    const x = clamp((v - SON.lo) / (SON.hi - SON.lo), 0, 1);
+    return 48 + x * 24;
+  }
+  function sonSnap(m) {
+    const pcs = SON_SCALES[SON.scale];
+    if (!pcs) return Math.round(m);
+    const base = Math.round(m);
+    let best = base, bd = Infinity;
+    for (let d = -3; d <= 3; d++) {
+      const q = base + d, pc = ((q % 12) + 12) % 12;
+      if (pcs.indexOf(pc) >= 0) {
+        const dd = Math.abs(q - m);
+        if (dd < bd - 1e-9) { bd = dd; best = q; }
+      }
+    }
+    return best;
+  }
+  function sonName(m) {
+    m = Math.round(m);
+    const pc = ((m % 12) + 12) % 12;
+    const oct = Math.floor(m / 12) - 1;
+    return { name: SON_NOTE[pc].replace('#', '♯') + oct,
+             solf: SON_SOLF[pc] + (SON_SHARP.indexOf(pc) >= 0 ? '♯' : '') };
+  }
+  const sonFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+
+  /* ---------- 点选声化：声像与亮度映射 ----------
+     chPan：方位角 → 声像（东 +1 / 西 -1，南北居中，抬头就能对上）；
+     chBright：C/N0 绝对值 → 音色亮度（强弱直觉放在音色上，不放音量上）。 */
+  function chPan(az) {
+    return clamp(Math.sin((az || 0) * Math.PI / 180), -1, 1);
+  }
+  function chBright(cn) { return clamp((cn - 20) / 28, 0, 1); }
+
+  /* ---------- 音频（首次点击 ♪ 才建，浏览器自动播放策略要求手势）---------- */
+  let sonCtx = null, sonMaster = null, sonDry = null, sonWet = null;
+
+  function sonMakeIR(dur, decay) {
+    const rate = sonCtx.sampleRate, len = Math.floor(rate * dur);
+    const buf = sonCtx.createBuffer(2, len, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+    }
+    return buf;
+  }
+
+  function sonAudioInit() {
+    if (sonCtx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    sonCtx = new AC();
+    const comp = sonCtx.createDynamicsCompressor();
+    comp.threshold.value = -12; comp.knee.value = 14; comp.ratio.value = 3.2;
+    comp.attack.value = 0.004; comp.release.value = 0.22;
+    sonMaster = sonCtx.createGain(); sonMaster.gain.value = SON.vol * 0.62;
+    sonDry = sonCtx.createGain(); sonDry.gain.value = 0.835;   // 混响固定 30%（SON.rev 已随参数简化删除）
+    sonWet = sonCtx.createGain(); sonWet.gain.value = 0.285;
+    const conv = sonCtx.createConvolver(); conv.buffer = sonMakeIR(1.9, 2.8);
+    sonDry.connect(comp);
+    sonWet.connect(conv); conv.connect(comp);
+    comp.connect(sonMaster); sonMaster.connect(sonCtx.destination);
+  }
+
+  /* ---------- 敲击音色表（从 v15.x 原样搬回，用户点名的就是这三样）----------
+     parts：r=相对基频的倍数（分音），g=幅度，d=衰减秒数；lp=低通上限。
+     bell 泛音多、尾巴长；glass 明亮偏"叮"；wood 短促偏"嗒"。 */
+  const SON_TIMBRES = {
+    bell:  { parts: [{ r: 1, g: 1.00, d: 2.4 }, { r: 2.00, g: 0.30, d: 1.5 },
+                     { r: 2.76, g: 0.15, d: 1.0 }, { r: 5.40, g: 0.05, d: 0.55 }], lp: 5200 },
+    glass: { parts: [{ r: 1, g: 1.00, d: 1.7 }, { r: 3.00, g: 0.22, d: 1.0 },
+                     { r: 5.00, g: 0.09, d: 0.6 }], lp: 9000 },
+    wood:  { parts: [{ r: 1, g: 1.00, d: 0.17 }, { r: 2.40, g: 0.22, d: 0.08 }], lp: 2600 }
+  };
+
+  /* 敲一下就走：每个分音各自起振、指数衰减到零，节点用完即弃（不留常驻声部） */
+  function sonStrike(freq, vel, timbre, pan) {
+    if (!sonCtx || !sonDry) return;
+    const T = SON_TIMBRES[timbre] || SON_TIMBRES.bell;
+    const t = sonCtx.currentTime;
+    const p = sonCtx.createStereoPanner();
+    p.pan.value = clamp(pan || 0, -1, 1);
+    p.connect(sonDry); p.connect(sonWet);
+    const lp = sonCtx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = T.lp; lp.Q.value = 0.5;
+    lp.connect(p);
+    T.parts.forEach(pt => {
+      const o = sonCtx.createOscillator(); o.type = 'sine';
+      o.frequency.value = freq * pt.r;
+      const g = sonCtx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(Math.max(0.0002, vel * pt.g), t + 0.007);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + pt.d);
+      o.connect(g); g.connect(lp);
+      o.start(t); o.stop(t + pt.d + 0.1);
+    });
+    setTimeout(() => { try { p.disconnect(); lp.disconnect(); } catch (e) {} }, (T.parts[0].d + 0.3) * 1000);
+  }
+
+
+  /* ================= 点选敲击引擎（★ v16.1）=================
+     天球上点谁谁"打点"：SON.picked 里的每颗星一个敲击通道。
+     ★ 不再是持续长音（v16 常驻振荡器用户听久不舒服）——音变了才敲一下，
+     敲完即走，和 v15.x 单声部敲击同一套手感。
+     音高 ← 该星 C/N0（量化到所选音阶）；音色 = 钟/玻璃/木（浮层选）；
+     声像 ← 方位角；力度 ← 亮度微调 + 声部数功率归一。
+     防糊三件套：换音门槛 0.8 dB（小抖不敲）→ 240 ms 确认（抖回来不敲）→
+     每星最小 450 ms / 全局最小 160 ms（多星同时变音排队让路）。 */
+  const SV = {
+    live: new Map(),          // prn -> {prn,sys,az,el,cn,seen}（GSV 偶尔少报，12 s 才退场）
+    st: new Map(),            // prn -> 敲击状态 {sm,curMidi,pend,pendAt,lastStrike,at,midi,cn,sys,az}
+    hist: new Map(),          // prn -> [{t, cn, s}]  24 s 轨迹
+    sampleAt: 0, lastAny: 0
+  };
+  const SV_HYST = 0.8;                              // 换音门槛（dB）
+  const SV_DB_SEMI = (SON.hi - SON.lo) / 24;        // 1.25 dB/半音（2 八度）
+
+  /* 每轮 poll 喂一次（applySats 末尾）。不直接覆盖已退场：延迟退场防闪断。 */
+  function sonFeed(list) {
+    const now = performance.now();
+    (list || []).forEach(s => {
+      if (!s.prn || !(s.snr > 0)) return;
+      SV.live.set(s.prn, { prn: s.prn, sys: s.sys, az: s.az, el: s.el, cn: s.snr, seen: now });
+    });
+    SV.live.forEach((v, k) => { if (now - v.seen > 12000) SV.live.delete(k); });
+    const b = el('sonBody');
+    if (b && SV.live.size) b.classList.remove('nodata');   // 摘掉"等 C/N0 数据"空态遮罩
+  }
+
+  /* 点选表变化：敲击状态与点选对齐（移除的星连状态一起清，轨迹线自然淡出） */
+  function svSync() {
+    const want = new Set(SON.picked);
+    SV.st.forEach((v, prn) => { if (!want.has(prn)) SV.st.delete(prn); });
+  }
+
+  function svStrike(prn, v, m, now) {
+    if (now - SV.lastAny < 160) { v.pend = m; v.pendAt = now; return; }   // 全局让路，稍后重敲
+    SV.lastAny = now;
+    v.curMidi = m; v.pend = null; v.lastStrike = now; v.at = now; v.midi = m;
+    const n = Math.max(1, SON.picked.length);
+    const vel = (0.45 + chBright(v.cn) * 0.2) / Math.sqrt(n);   // 力度：亮星略响，多星功率归一
+    sonStrike(sonFreq(m), vel, SON.timbre, chPan(v.az || 0));
+  }
+
+  /* 敲击判定（与 v15.x sonResolve 同一套手感，逐星化）：
+     量化音变了且跨过门槛 → 挂起 240 ms 确认（抖回去就不敲）→ 每星 450 ms 限速 */
+  function svTick(now) {
+    // 轨迹采样不依赖发声开关：画面随时是活的
+    if (now - SV.sampleAt >= 500) {
+      SV.sampleAt = now;
+      const tt = now / 1000;
+      SON.picked.forEach(prn => {
+        const s = SV.live.get(prn); if (!s) return;
+        let h = SV.hist.get(prn);
+        if (!h) { h = []; SV.hist.set(prn, h); }
+        h.push({ t: tt, cn: s.cn, s: s.sys });
+        while (h.length && tt - h[0].t > 30) h.shift();
+      });
+      SV.hist.forEach((h, k) => {
+        if (SON.picked.indexOf(k) < 0 && (!h.length || tt - h[h.length - 1].t > 30)) SV.hist.delete(k);
+      });
+    }
+    if (!sonCtx || !SON.power) return;
+
+    SON.picked.forEach(prn => {
+      const s = SV.live.get(prn);
+      if (!s || s.cn < CH_FLOOR) return;            // 星没报上来 / 信号太弱：不出声
+      let v = SV.st.get(prn);
+      if (!v) {
+        v = { sm: s.cn, curMidi: null, pend: null, pendAt: 0, lastStrike: 0, at: 0, midi: null, cn: s.cn, sys: s.sys, az: s.az };
+        SV.st.set(prn, v);
+      }
+      v.cn = s.cn; v.sys = s.sys; v.az = s.az;
+      v.sm += (s.cn - v.sm) * 0.18;                 // 轻平滑：滤 GSV 采样抖，不做长平滑
+      const m = sonSnap(sonMidiOf(v.sm));
+      if (v.curMidi == null) { svStrike(prn, v, m, now); return; }   // 首次：报个到
+      const dB = Math.abs(m - v.curMidi) * SV_DB_SEMI;
+      if (m !== v.curMidi && dB >= SV_HYST) {
+        if (v.pend !== m) { v.pend = m; v.pendAt = now; }
+        else if (now - v.pendAt > 240 && now - v.lastStrike > 450) svStrike(prn, v, m, now);
+      } else v.pend = null;
+    });
+  }
+
+  /* ---------- 每帧：声部更新 + 绘制（限 30 fps）。没点星也刷读数，
+     让 08 面板随时显示"当前点了几个"。 ---------- */
+  function sonTick(now) {
+    const dt = SON.lastT ? Math.min(0.25, (now - SON.lastT) / 1000) : 0.016;
+    SON.lastT = now;
+    svTick(now);
+    if (now - SON.drawAt < 33) return;
+    SON.drawAt = now;
+    sonDrawBand(); sonDrawRoll(); sonDrawReadout();
+  }
+
+  /* ---------- 可视化：音高带（上）+ 24 s 多声部轨迹（下）----------
+     上：每颗在唱的星一根柱，x=音高（C/N0 量化到音阶后的位置）、高=音量、
+         点的大小/亮度=C/N0 —— 看得见"此刻在和弦"。
+     下：每声部一条 C/N0 曲线，固定 5–50 dB 量程（平的就是平的，动多少是多少）。 */
+  function sonDrawBand() {
+    const g = SON.kx, w = SON.kw, h = SON.kh;
+    if (!g || !w) return;
+    g.clearRect(0, 0, w, h);
+    const padL = 7, padR = 7, top = 6, padB = 12;
+    const railH = Math.max(8, h - top - padB);
+    const LO = 48, HI = 72;                          // C3…C5（sonMidiOf 同一音域）
+    const xOf = m => padL + (m - LO) / (HI - LO) * (w - padL - padR);
+
+    const sc = SON_SCALES[SON.scale] || SON_SCALES.pent;
+    g.font = '8px "JetBrains Mono",Consolas,monospace';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (let o = 0; o < 2; o++) {
+      for (let i = 0; i < sc.length; i++) {
+        const m = LO + o * 12 + sc[i], x = xOf(m);
+        g.fillStyle = 'rgba(96,196,222,.09)';
+        g.fillRect(x - 0.5, top, 1, railH);
+        if (sc[i] === 0) {
+          g.fillStyle = '#3f5c6b';
+          g.fillText(sonName(m).name, x, h - 4);
+        }
+      }
+    }
+    g.fillStyle = 'rgba(62,200,230,.16)';
+    g.fillRect(padL, h - padB + 0.5, w - padL - padR, 1);
+
+    // dB 刻度：15 / 25 / 35 / 45（与音高一一线性对应）
+    g.textBaseline = 'alphabetic';
+    [15, 25, 35, 45].forEach(db => {
+      const x = xOf(LO + (db - SON.lo) / (SON.hi - SON.lo) * 24);
+      g.fillStyle = 'rgba(62,200,230,.13)';
+      g.fillRect(x, h - padB + 2, 1, 3);
+      g.fillStyle = '#3f5c6b';
+      g.fillText(String(db), clamp(x, 10, w - 10), h - 1);
+    });
+
+    // ★ v16.1 敲击语义：常驻小点 = 该星当前音高位置；敲一下亮柱闪现、1.5 s 内衰减
+    const tnow = performance.now();
+    SON.picked.forEach(prn => {
+      const v = SV.st.get(prn); if (!v || v.midi == null) return;
+      const col = (SYS[v.sys] || SYS.GPS).color;
+      const glow = v.at ? clamp(1 - (tnow - v.at) / 1500, 0, 1) : 0;
+      const b = chBright(v.cn || 0);
+      const x = xOf(v.midi);
+
+      // 常驻位置标记：点的高度随亮度（看得见每颗星"坐"在哪个音上）
+      g.fillStyle = hexA(col, 0.30 + b * 0.25);
+      g.beginPath(); g.arc(x, h - padB - 3 - b * (railH - 9), 1.6 + b * 1.2, 0, 6.2832); g.fill();
+
+      // 敲击闪光：柱 + 顶端亮点，随时间衰减归零
+      if (glow > 0) {
+        const bh = Math.max(3, (0.35 + b * 0.65) * (railH - 3));
+        g.fillStyle = hexA(col, 0.12 + glow * 0.55);
+        g.fillRect(x - 1.2, h - padB - bh, 2.4, bh);
+        g.fillStyle = hexA(col, glow * 0.9);
+        g.beginPath(); g.arc(x, h - padB - bh - 2.5, 1.8 + glow * 1.8, 0, 6.2832); g.fill();
+      }
+      if (SON.picked.length <= 6) {
+        g.fillStyle = hexA(col, 0.45 + glow * 0.35);
+        g.fillText(prn, x, top - 1);
+      }
+    });
+  }
+
+  function sonDrawRoll() {
+    const g = SON.rx, w = SON.rw, h = SON.rh;
+    if (!g || !w) return;
+    g.clearRect(0, 0, w, h);
+    const padL = 6, padR = 6, padT = 6, padB = 5;
+    const now = performance.now() / 1000, win = 24;
+    const CN_LO = 5, CN_HI = 50;                        // 固定量程，不自适应缩放
+    const xOf = t => padL + (1 - (now - t) / win) * (w - padL - padR);
+    const yOf = cn => padT + (1 - (clamp(cn, CN_LO, CN_HI) - CN_LO) / (CN_HI - CN_LO)) * (h - padT - padB);
+
+    for (let s = 0; s <= win; s += 6) {
+      const x = padL + (1 - s / win) * (w - padL - padR);
+      g.strokeStyle = 'rgba(96,196,222,.045)'; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x, padT); g.lineTo(x, h - padB); g.stroke();
+    }
+    g.font = '8px "JetBrains Mono",Consolas,monospace';
+    g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillStyle = '#3f5c6b';
+    g.fillText('C/N0 dB', padL + 1, padT - 1);
+
+    SV.hist.forEach((arr, prn) => {
+      if (!arr || arr.length < 2) return;
+      const last = arr[arr.length - 1];
+      if (now - last.t > win) return;
+      const v = SV.st.get(prn);
+      const col = (SYS[last.s || (v && v.sys)] || SYS.GPS).color;
+      const on = SON.picked.indexOf(prn) >= 0;
+      const fade = on ? 1 : clamp(1 - (now - last.t) / 6, 0.12, 1);   // 取消点选的线 6 s 内淡掉
+      g.strokeStyle = hexA(col, 0.72 * fade);
+      g.lineWidth = 1.3;
+      g.beginPath();
+      let started = false;
+      for (let i = 0; i < arr.length; i++) {
+        const q = arr[i];
+        if (now - q.t > win) continue;
+        const x = xOf(q.t), y = yOf(q.cn);
+        if (started) g.lineTo(x, y); else { g.moveTo(x, y); started = true; }
+      }
+      if (started) g.stroke();
+      if (on && v && v.cn != null) {
+        // 敲击瞬间端点变大变亮（和音高带的闪光对得上）
+        const glow = v.at ? clamp(1 - (performance.now() - v.at) / 1500, 0, 1) : 0;
+        g.fillStyle = col;
+        g.beginPath(); g.arc(xOf(last.t), yOf(v.cn), 1.6 + glow * 2.2, 0, 6.2832); g.fill();
+        if (SON.picked.length <= 6) {
+          g.font = '8px "JetBrains Mono",Consolas,monospace';
+          g.fillText(prn, xOf(last.t) + 3, yOf(v.cn) - 3);
+        }
+      }
+    });
+  }
+
+  function sonResize() {
+    const a = document.getElementById('chSonKeys');
+    const b = document.getElementById('chSonRoll');
+    if (!a || !b) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    [[a, 'kx', 'kw', 'kh'], [b, 'rx', 'rw', 'rh']].forEach(t => {
+      const cv = t[0];
+      const r = cv.parentElement.getBoundingClientRect();
+      const w = Math.max(40, Math.round(r.width)), h = Math.max(16, Math.round(r.height));
+      cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      SON[t[1]] = g; SON[t[2]] = w; SON[t[3]] = h;
+    });
+    sonDrawBand(); sonDrawRoll(); sonDrawReadout();
+  }
+
+  function sonDrawReadout() {
+    const a = el('sonCn'); if (!a) return;
+    const n = SON.picked.length;
+    /* 读数 = 点选各星 C/N0 的中位（一颗时就是它自己）；无点选显示 -- */
+    let med = null;
+    if (n) {
+      const cns = [];
+      SON.picked.forEach(prn => { const s = SV.live.get(prn); if (s) cns.push(s.cn); });
+      if (cns.length) { cns.sort((x, y) => x - y); med = cns[Math.floor(cns.length / 2)]; }
+    }
+    a.textContent = med != null ? med.toFixed(1) : '--';
+    const u = el('sonUnit'); if (u) u.textContent = 'dB-Hz';
+    const nt = el('sonNote');
+    if (nt) { nt.className = 'snote ch'; nt.textContent = n ? '♪ ' + n : '--'; }
+    const so = el('sonSolf');
+    if (so) { so.className = 'ssolf ch'; so.textContent = n ? 'PICKED' : 'IDLE'; }
+    const fr = el('sonFreq');
+    if (fr) fr.textContent = SON.power && n ? 'AUDIBLE' : '';
+  }
+
+  /* ---------- 交互 ---------- */
+  function sonSyncUI() {
+    document.querySelectorAll('#sonCfg .seg').forEach(seg => {
+      const k = seg.dataset.k;
+      const v = String(SON[k]);
+      Array.prototype.forEach.call(seg.children, b => b.classList.toggle('on', b.dataset.v === v));
+    });
+    const set = (id, val, txt) => {
+      const e = el(id); if (e) e.value = val;
+      const t = el(id.replace('s', 'v')); if (t) t.textContent = txt;
+    };
+    set('sVol', Math.round(SON.vol * 100), Math.round(SON.vol * 100) + '%');
+  }
+
+  function sonPowerToggle() {
+    sonAudioInit();
+    if (sonCtx && sonCtx.state === 'suspended') sonCtx.resume();
+    SON.power = !SON.power;
+    const b = el('sonPower');
+    if (b) { b.classList.toggle('on', SON.power); b.textContent = SON.power ? '♪ 发声' : '♪ 静音'; }
+    if (SON.power) {
+      SV.st.forEach(v => { v.curMidi = null; v.pend = null; });   // 重新报个到：每颗星先敲一声
+      SV.lastAny = 0;
+    }
+  }
+
+  /* ★ v16 天球点选命中：找点击位置最近的可见星（≤18 CSS px）。
+     canvas 逻辑坐标 = W×H，CSS 尺寸可能被缩放，先换算比例。 */
+  function sonHitStar(e) {
+    if (!sats.length) return null;
+    const r = cv.getBoundingClientRect();
+    if (!r.width) return null;
+    const k = W / r.width;                          // CSS px → 逻辑 px
+    const lx = (e.clientX - r.left) * k, ly = (e.clientY - r.top) * k;
+    const g = geom();
+    let best = null, bd = Math.pow(18 * k, 2);
+    for (const s of sats) {
+      const st = stMap.get(s.prn); if (!st) continue;
+      const p = projD(st.az, st.el, g);
+      const d = (p.x - lx) * (p.x - lx) + (p.y - ly) * (p.y - ly);
+      if (d < bd) { bd = d; best = s.prn; }
+    }
+    return best;
+  }
+
+  function sonCfgToggle(force) {
+    const p = el('sonCfg'), gear = el('sonGear');
+    if (!p || !gear) return;
+    const open = (force === undefined) ? p.hidden : force;
+    if (!open) { p.hidden = true; gear.classList.remove('on'); return; }
+    p.hidden = false; gear.classList.add('on');
+    const r = gear.getBoundingClientRect();
+    const pw = p.offsetWidth, ph = p.offsetHeight;
+    let x = r.right - pw, y = r.bottom + 6;
+    x = clamp(x, 8, Math.max(8, window.innerWidth - pw - 8));
+    if (y + ph > window.innerHeight - 8) y = Math.max(8, r.top - ph - 6);
+    p.style.left = Math.round(x) + 'px';
+    p.style.top = Math.round(y) + 'px';
+  }
+
+  function sonInit() {
+    document.querySelectorAll('#sonCfg .seg').forEach(seg => {
+      seg.addEventListener('click', e => {
+        const b = e.target.closest('button'); if (!b) return;
+        SON[seg.dataset.k] = b.dataset.v;          // 浮层里只有 音阶 / 音色 两个段
+        sonSyncUI(); sonSavePrefs();
+        /* 换音色：当场敲一声试听（音频上下文按需建，浏览器手势策略允许） */
+        if (seg.dataset.k === 'timbre') {
+          sonAudioInit();
+          if (sonCtx && sonCtx.state === 'suspended') sonCtx.resume();
+          sonStrike(sonFreq(62), 0.5, SON.timbre, 0);     // D4 试听音
+        }
+        /* 换音阶：声部不重建，下一个更新周期直接滑到新音阶上最近的音 */
+        sonResize();
+      });
+    });
+
+    const bindSlide = (id, fn) => {
+      const e = el(id);
+      if (e) e.addEventListener('input', ev => { fn(Number(ev.target.value)); sonSyncUI(); sonSavePrefs(); });
+    };
+    bindSlide('sVol', v => {
+      SON.vol = v / 100;
+      if (sonMaster && sonCtx) sonMaster.gain.setTargetAtTime(SON.vol * 0.62, sonCtx.currentTime, 0.05);
+    });
+
+    const pw = el('sonPower');
+    if (pw) pw.addEventListener('click', sonPowerToggle);
+    const gr = el('sonGear');
+    if (gr) gr.addEventListener('click', e => { e.stopPropagation(); sonCfgToggle(); });
+    const cx = el('sonCfgX');
+    if (cx) cx.addEventListener('click', () => sonCfgToggle(false));
+    document.addEventListener('pointerdown', e => {
+      const p = el('sonCfg');
+      if (!p || p.hidden) return;
+      if (e.target.closest('#sonCfg') || e.target.closest('#sonGear')) return;
+      sonCfgToggle(false);
+    });
+    window.addEventListener('keydown', e => {
+      if (e.code === 'Escape') sonCfgToggle(false);
+    });
+
+    /* ★ v16 天球点选：点谁谁唱。命中半径 18 CSS px，最多 8 颗（再多会糊）。
+       音频没开也允许点——选好的星等 ♪ 一按就唱。 */
+    const dome = el('sphere');
+    if (dome) {
+      dome.addEventListener('pointerdown', e => {
+        const prn = sonHitStar(e);
+        if (!prn) return;
+        const i = SON.picked.indexOf(prn);
+        if (i >= 0) SON.picked.splice(i, 1);
+        else {
+          if (SON.picked.length >= 8) return;
+          SON.picked.push(prn);
+        }
+        sonSavePrefs();
+        svSync();
+      });
+      dome.addEventListener('pointermove', e => {
+        dome.style.cursor = sonHitStar(e) ? 'pointer' : '';
+      });
+    }
+
+    sonSyncUI();
+    sonResize();
+    window.__SONDBG = {                         // 诊断口：点选表/声部数量现场可查
+      SON: SON, SV: SV,
+      get ctx() { return sonCtx; },             // 供录制：取音频上下文
+      get master() { return sonMaster; }        // 供录制：取总输出母线
+    };
+  }
+
+  function layInit() {
+    const box = layBox(); if (!box) return;
+    LAY.items = [];
+    box.querySelectorAll('.panel[data-p]').forEach(p => {
+      const id = p.dataset.p;
+      const hd = document.createElement('div');
+      hd.className = 'layhandle';
+      p.appendChild(hd);
+      const it = { id, el: p, x: 0, y: 0, w: 3, h: 6 };
+      LAY.items.push(it);
+      const head = p.querySelector('.ph');
+      head.addEventListener('pointerdown', e => {
+        if (!LAY.edit || e.target.closest('button')) return;
+        layDragStart(e, it, 'move');
+      });
+      hd.addEventListener('pointerdown', e => layDragStart(e, it, 'resize'));
+    });
+    LAY.items.sort((a, b) => a.id.localeCompare(b.id));
+
+    layStageInit();
+
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem('gnss.layout.v2') || 'null'); } catch (e) { saved = null; }
+    /* ★ v15.5：存档带版本号。ver !== 2 的旧档（旧 dome 排布）直接作废，改用新预设 ——
+       否则改了 presets.dome 也永远被旧存档压住。 */
+    if (saved && saved.pos && saved.ver === 2) {
+      layApply(saved.pos, saved.name || 'free');
+    } else {
+      saved = null;
+      layApply(LAY.presets[LAY.name], LAY.name);
+      // 本机没存过 → 取服务器存档（换浏览器 / 清缓存后仍是你调好的版式）
+      fetch('/api/layout').then(r => r.json()).then(o => {
+        if (o && o.pos && o.ver === 2) layApply(o.pos, o.name || 'free');
+      }).catch(() => {});
+    }
+    laySave();                       // 打开即上报一次，服务器始终有一份当前版式
+
+    /* ★ v15.5：顶栏"预设/编辑/重置"按钮组已删 —— 绑定一并移除，
+       布局引擎与存档读写保留（版式固定为存档/预设）。 */
+    window.addEventListener('resize', () => { layFlush(); layRefresh(); });
+  }
+
+  /* =========================================================
+     6. 启动
+  ========================================================= */
+  function clock() {
+    // ★ 时间轴一律用 OBS 第 18 列 utc（GNSS 时间）；PC 本地钟只负责"过了几秒"的插值
+    const now = gnssNow();
+    if (!now) { el('utc').textContent = '--:--:--'; return; }
+    const t = new Date(now * 1000);
+    el('utc').textContent = pad2(t.getUTCHours()) + ':' + pad2(t.getUTCMinutes()) + ':' + pad2(t.getUTCSeconds());
+  }
+
+  let lastRx = 0;
+  function staleTick() {
+    if (!live) return;
+    // 页面自己判断"多久没新包"：服务端 2 s 才回一次，这里只做灰化
+    if (lastRx && performance.now() - lastRx > 15000) setLink({ state: 'warn' });
+    if (lastRx && performance.now() - lastRx > 60000) setLink({ state: 'down' });
+  }
+
+  /* ★ 卡顿治理：这段启动代码原来重复了两遍（resize/buildLegend/buildTable 各跑两次，
+     clock 还挂了 200 ms 和 500 ms 两个定时器）。逐秒触发 DOM 改写会不断把布局标脏，
+     正好被 rAF 里的测量强制结算 —— 一并去重。 */
+  resize();
+  buildLegend();
+  buildTable();
+  el('utc').textContent = '--:--:--';
+  clock();
+
+  /* ★ v8：布局引擎 + 05 画法切换 */
+  layInit();
+  sonInit();                        // ★ v13：08 声化（画布量尺寸 + 参数回填，必须排在 layInit 之后）
+  document.querySelectorAll('#offSeg button').forEach(b => {
+    b.classList.toggle('on', b.dataset.v === offViz);
+    b.addEventListener('click', () => {
+      offViz = b.dataset.v;
+      try { localStorage.setItem('gnss.offviz', offViz); } catch (e) {}
+      document.querySelectorAll('#offSeg button').forEach(x => x.classList.toggle('on', x === b));
+      drawOffViz();
+    });
+  });
+
+  poll();
+  setInterval(() => { if (!document.hidden) poll(); }, 2000);
+  setInterval(clock, 500);          // 秒针只挂一个（原来是 200 + 500 两个）
+  setInterval(staleTick, 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

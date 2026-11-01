@@ -133,6 +133,21 @@ Main screen (starfield particle background + live quantities in the four corners
 
 The charts page has four live cards: per-satellite bars, error trend, integrity, detectors — every one of them moves, proving the math is really running.
 
+### 5.1 PC-side live dashboard
+
+There is also a browser dashboard (`tools/dashboard/`). The S3 pushes its parsed results over the LAN,
+the service picks them up, and the page renders eight draggable/resizable panels: live metrics, sky dome,
+alarms and counters, SQW−PPS pulse comparison, position offset, median C/N0 trend, integrity detectors,
+and C/N0 sonification.
+
+**Sonification** turns the constellation into an instrument: click satellites directly on the 02 sky dome,
+and each picked satellite sounds its own C/N0 — **a strike only when the pitch changes** (bell / glass / wood),
+up to eight voices. A strong, steady satellite strikes once every ten seconds or so; a weak low-elevation
+one sounds like rain. Everything is synthesised in-page with Web Audio.
+
+The service has zero third-party dependencies (Python standard library only). `python dashboard.py`
+serves on 8787 and the page polls `/api/live` every 2 s. See [`tools/dashboard/README.md`](tools/dashboard/README.md).
+
 ---
 
 ## 6. One pitfall worth its own section
@@ -236,6 +251,7 @@ docs/
 tools/
   cusum_replay.py    offline CUSUM replay (reproduces the section 4.2 conclusion)
   check_proto_sync.py two-board protocol-version consistency check
+  dashboard/        PC-side live dashboard (dependency-free HTTP service + single-page UI, with sonification)
 ```
 
 ---

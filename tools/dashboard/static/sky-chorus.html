@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>天空合唱 · C/N0 连续声化试听</title>
+<style>
+  :root{
+    --bg:#050d13; --panel:rgba(8,20,27,.92); --line:rgba(62,224,255,.20);
+    --line-soft:rgba(62,224,255,.10); --cyan:#3ee0ff; --txt:#cfe8f2;
+    --dim:#6d93a5; --dim2:#3f5c6b;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(30,120,160,.18), transparent 60%),
+      var(--bg);
+    color:var(--txt);
+    font:13px/1.5 "JetBrains Mono","Cascadia Mono",Consolas,"Noto Sans SC",monospace;
+    overflow:hidden;
+  }
+  #wrap{height:100%;display:flex;flex-direction:column;padding:14px 16px 12px;gap:10px}
+
+  header{display:flex;align-items:baseline;gap:12px;flex:0 0 auto}
+  header h1{font-size:15px;font-weight:400;letter-spacing:.14em;margin:0;color:#dff4fb}
+  header h1 b{color:var(--cyan);font-weight:600;margin-right:7px}
+  header .sub{color:var(--dim);font-size:11.5px;letter-spacing:.04em}
+  header .fill{flex:1}
+  .chip{border:1px solid var(--line);padding:2px 8px;font-size:10.5px;letter-spacing:.1em;color:#8edcf0}
+  .chip b{color:#dff4fb}
+
+  main{flex:1;min-height:0;display:grid;grid-template-columns:1fr 340px;gap:12px}
+
+  .card{background:var(--panel);border:1px solid var(--line-soft);position:relative;display:flex;flex-direction:column;min-height:0}
+  .card > .ph{
+    flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:7px 11px;
+    border-bottom:1px solid var(--line-soft);font-size:11.5px;letter-spacing:.09em;color:#9dc4d3;
+  }
+  .card > .ph b{color:var(--cyan);font-weight:600}
+  .card > .ph .fill{flex:1}
+  .card > .ph .meta{color:var(--dim2);font-size:10px;letter-spacing:.12em}
+
+  #left{display:grid;grid-template-rows:1fr 118px;gap:12px;min-height:0}
+  #domeBox{position:relative;min-height:0;overflow:hidden}
+  #dome{display:block;width:100%;height:100%}
+
+  #evid{padding:0}
+  #evid .pbody{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:8px 11px}
+  .trace{position:relative;min-width:0;display:flex;flex-direction:column}
+  .trace .cl{font-size:10.5px;color:var(--dim);letter-spacing:.06em;flex:0 0 auto;margin-bottom:3px}
+  .trace .cl b{color:#9dc4d3;font-weight:400}
+  .trace canvas{flex:1;min-height:0;width:100%;display:block}
+  .trace .note{position:absolute;right:0;top:0;font-size:9.5px;color:var(--dim2)}
+
+  aside{display:flex;flex-direction:column;gap:12px;min-height:0}
+
+  #voices{flex:1;min-height:0}
+  #voiceList{flex:1;min-height:0;overflow:auto;padding:4px 0}
+  .vrow{display:flex;align-items:center;gap:7px;padding:3px 11px;font-size:11px;color:#a9c8d6}
+  .vrow .dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+  .vrow .prn{width:44px;flex:0 0 auto;color:#dff4fb}
+  .vrow .nt{width:40px;flex:0 0 auto;color:var(--cyan);font-size:10.5px}
+  .vrow .bar{flex:1;height:4px;background:rgba(62,200,230,.10);position:relative;min-width:16px}
+  .vrow .bar i{position:absolute;left:0;top:0;bottom:0;background:var(--cyan);opacity:.75}
+  .vrow .lv{width:34px;text-align:right;flex:0 0 auto;color:var(--dim);font-size:10px}
+  .vrow.idle{opacity:.34}
+
+  #ctl{flex:0 0 auto;padding:9px 11px 11px;display:flex;flex-direction:column;gap:8px}
+  .row{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dim)}
+  .row label{width:74px;flex:0 0 auto;letter-spacing:.05em}
+  .row input[type=range]{flex:1;min-width:0;height:14px;-webkit-appearance:none;background:none;outline:none}
+  .row input[type=range]::-webkit-slider-runnable-track{height:3px;background:rgba(62,200,230,.16)}
+  .row input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;width:11px;height:11px;margin-top:-4px;border-radius:50%;
+    background:var(--cyan);border:0;box-shadow:0 0 7px rgba(62,224,255,.6)}
+  .row .val{width:40px;text-align:right;flex:0 0 auto;color:#9dc4d3;font-size:10.5px}
+
+  .seg{display:flex;gap:1px;flex:0 0 auto}
+  .seg button{
+    font:inherit;font-size:10.5px;letter-spacing:.05em;color:#7fa2b3;background:none;
+    border:1px solid rgba(62,200,230,.16);padding:2px 7px;cursor:pointer;white-space:nowrap;
+  }
+  .seg button.on{color:#02141a;background:var(--cyan);border-color:var(--cyan)}
+
+  #go{
+    flex:0 0 auto;margin-top:2px;font:inherit;font-size:13px;letter-spacing:.14em;
+    color:#02141a;background:var(--cyan);border:0;padding:10px;cursor:pointer;
+    box-shadow:0 0 22px rgba(62,224,255,.28);
+  }
+  #go.playing{background:transparent;color:var(--cyan);border:1px solid var(--line);
+    box-shadow:none}
+  #hint{font-size:10.5px;color:var(--dim2);line-height:1.6;flex:0 0 auto}
+
+  #err{position:fixed;left:16px;bottom:12px;font-size:11px;color:#ff9c8a;max-width:60vw}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <h1><b>天空合唱</b>SKY CHORUS</h1>
+    <span class="sub">音高＝仰角 · 音色亮度＝C/N0 绝对值 · 音量＝偏离中位数的抖动 · 声像＝方位</span>
+    <span class="fill"></span>
+    <span class="chip" id="chipSrc">数据源 <b>--</b></span>
+    <span class="chip" id="chipVoices">声部 <b>0</b></span>
+  </header>
+
+  <main>
+    <div id="left">
+      <section class="card" id="domeBox">
+        <div class="ph"><b>01</b> 声场 <span class="fill"></span>
+          <span class="meta" id="domeMeta">方位 × 仰角 · 圆点大小＝C/N0</span></div>
+        <canvas id="dome"></canvas>
+      </section>
+
+      <section class="card" id="evid">
+        <div class="ph"><b>02</b> 为什么中位数是死的
+          <span class="fill"></span>
+          <span class="meta">左：21 颗星的中位数　右：抖得最厉害的那一颗</span></div>
+        <div class="pbody">
+          <div class="trace">
+            <div class="cl">中位 C/N0　<b id="tMed">--</b> dB-Hz</div>
+            <canvas id="trMed"></canvas>
+            <div class="note">一条直线</div>
+          </div>
+          <div class="trace">
+            <div class="cl"><b id="tVarPrn">--</b>　<b id="tVar">--</b> dB-Hz　摆幅 <b id="tSwing">--</b></div>
+            <canvas id="trSum"></canvas>
+            <div class="note">一直在动</div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <aside>
+      <section class="card" id="voices">
+        <div class="ph"><b>03</b> 声部 <span class="fill"></span>
+          <span class="meta" id="vMeta">极值优先 · 中间值让位</span></div>
+        <div id="voiceList"></div>
+      </section>
+
+      <section class="card" id="ctl">
+        <div class="row"><label>主音量</label>
+          <input type="range" id="sVol" min="0" max="100" value="62">
+          <span class="val" id="vVol">62</span></div>
+        <div class="row"><label>混响</label>
+          <input type="range" id="sRev" min="0" max="100" value="34">
+          <span class="val" id="vRev">34</span></div>
+        <div class="row"><label>声部上限</label>
+          <input type="range" id="sCap" min="6" max="22" value="16">
+          <span class="val" id="vCap">10</span></div>
+        <div class="row"><label>呼吸深度</label>
+          <input type="range" id="sBr" min="0" max="100" value="45">
+          <span class="val" id="vBr">45</span></div>
+        <div class="row"><label>风铃间隔</label>
+          <input type="range" id="sCh" min="0" max="8" value="2" step="1">
+          <span class="val" id="vCh">2s</span></div>
+        <div class="row"><label>风铃</label>
+          <span class="seg" id="segCh">
+            <button data-on="1" class="on">开</button><button data-on="0">关</button>
+          </span>
+          <span class="fill" style="flex:1"></span>
+          <span class="seg" id="segDemo">
+            <button data-demo="0" class="on">实时</button><button data-demo="1">演示</button>
+          </span>
+        </div>
+        <button id="go">开 始 发 声</button>
+        <div id="hint">
+          浏览器要求先点一次才开始播声音。没有板子数据时自动切「演示」，
+          用合成卫星跑同一套算法。
+        </div>
+      </section>
+    </aside>
+  </main>
+</div>
+<div id="err"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ================= 常量与映射 ================= */
+  const SYS = {
+    G: { color: '#4fd1ff', label: 'GPS' },
+    B: { color: '#ffb454', label: '北斗' },
+    E: { color: '#7cf0c0', label: '伽利略' },
+    R: { color: '#c79bff', label: '格洛纳斯' },
+    J: { color: '#ff8fb0', label: 'QZSS' },
+    C: { color: '#9fd0e0', label: '北斗3' }
+  };
+  // D 小调五声：D F G A C（相对 D 的半音偏移）
+  const PENTA = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24];
+  const ROOT_MIDI = 50;                       // D3
+  const CN_MIN = 20, CN_MAX = 48;             // 音色亮度映射范围
+  const CN_FLOOR = 14;                        // 低于此值不进声部
+  const LV_BASE = -25;                        // 等响基点 dBFS
+
+  const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+  function noteName(midi) {
+    const n = Math.round(midi);
+    const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    return names[((n % 12) + 12) % 12] + (Math.floor(n / 12) - 1);
+  }
+  // 仰角 0..90 → 五声音阶索引 → midi
+  function midiOfEl(el) {
+    const t = Math.max(0, Math.min(1, el / 90));
+    const i = Math.round(t * (PENTA.length - 1));
+    return ROOT_MIDI + PENTA[i];
+  }
+  function panOfAz(az) {
+    const r = (az || 0) * Math.PI / 180;
+    return Math.max(-1, Math.min(1, Math.sin(r)));   // 东 +1，西 -1，南北居中
+  }
+  // ★ 关键修改：音量用「相对天空中位数的偏差」而不是绝对值。
+  //   绝对值会让稳定的强星占满能量、弱星的抖动被淹没（实测总响度极差仅 0.27 dB）。
+  //   改等响混合后，每颗星的抖动都落在可听范围；绝对强弱交给「音色亮度」表达。
+  function levelOfCn(cn, med) {
+    const dev = cn - (med || 38);
+    const db = LV_BASE + Math.max(-6, Math.min(6, dev * 0.55));
+    return Math.pow(10, db / 20);
+  }
+  // 绝对 C/N0 → 音色亮度 0..1（强星泛音多、亮；弱星只有基音、闷）
+  function brightOfCn(cn) {
+    return Math.max(0, Math.min(1, (cn - 20) / 28));
+  }
+  function medianOf(arr) {
+    if (!arr.length) return 0;
+    const a = arr.slice().sort((x, y) => x - y);
+    return a[Math.floor(a.length / 2)];
+  }
+
+  /* ================= 音频引擎 ================= */
+  const AU = {
+    ctx: null, master: null, bus: null, dry: null, wet: null, conv: null,
+    voices: new Map(), on: false, started: false
+  };
+
+  function makeImpulse(sec, decay) {
+    const sr = AU.ctx.sampleRate, n = Math.floor(sr * sec);
+    const buf = AU.ctx.createBuffer(2, n, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      let lp = 0;
+      for (let i = 0; i < n; i++) {
+        const k = i / n;
+        const noise = (Math.random() * 2 - 1);
+        lp = lp * 0.72 + noise * 0.28;                 // 稍暗，避免发刺
+        d[i] = lp * Math.pow(1 - k, decay) * (1 - k * 0.15);
+      }
+    }
+    return buf;
+  }
+
+  function initAudio() {
+    if (AU.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    AU.ctx = new AC();
+    AU.master = AU.ctx.createGain();
+    const sv = document.getElementById('sVol');
+    AU.master.gain.value = sv ? (+sv.value / 100) * 1.1 : 0.68;
+    const comp = AU.ctx.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 14; comp.ratio.value = 4;
+    comp.attack.value = 0.006; comp.release.value = 0.25;
+    AU.master.connect(comp); comp.connect(AU.ctx.destination);
+
+    AU.bus = AU.ctx.createGain(); AU.bus.gain.value = 0.9;
+    AU.dry = AU.ctx.createGain(); AU.dry.gain.value = 0.78;
+    AU.wet = AU.ctx.createGain(); AU.wet.gain.value = 0.34;
+    AU.conv = AU.ctx.createConvolver();
+    AU.conv.buffer = makeImpulse(2.9, 2.6);
+    AU.bus.connect(AU.dry); AU.dry.connect(AU.master);
+    AU.bus.connect(AU.conv); AU.conv.connect(AU.wet); AU.wet.connect(AU.master);
+  }
+
+  function ensureVoice(prn) {
+    let v = AU.voices.get(prn);
+    if (v) return v;
+    const t = AU.ctx.currentTime;
+    const osc = AU.ctx.createOscillator(); osc.type = 'sine';
+    const osc2 = AU.ctx.createOscillator(); osc2.type = 'triangle';
+    const g2 = AU.ctx.createGain(); g2.gain.value = 0.14;      // 一点三角波给厚度
+    const env = AU.ctx.createGain(); env.gain.value = 0.0001;
+    const lp = AU.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 1200; lp.Q.value = 0.7;
+    const pan = AU.ctx.createStereoPanner();
+    const lfo = AU.ctx.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.5;
+    const lfoG = AU.ctx.createGain(); lfoG.gain.value = 0;
+
+    osc.connect(env); osc2.connect(g2); g2.connect(env);
+    env.connect(lp); lp.connect(pan); pan.connect(AU.bus);
+    lfo.connect(lfoG); lfoG.connect(env.gain);
+    osc.start(t); osc2.start(t); lfo.start(t);
+
+    v = { prn, osc, osc2, g2, env, lp, pan, lfo, lfoG,
+          level: 0, slow: null, hist: [], dyingSince: 0, active: false };
+    AU.voices.set(prn, v);
+    return v;
+  }
+
+  function killVoice(v) {
+    const t = AU.ctx.currentTime;
+    try {
+      v.env.gain.cancelScheduledValues(t);
+      v.env.gain.setTargetAtTime(0.0001, t, 0.35);
+      v.osc.stop(t + 2.4); v.osc2.stop(t + 2.4); v.lfo.stop(t + 2.4);
+    } catch (e) {}
+    AU.voices.delete(v.prn);
+  }
+
+  /* 每颗星的声部更新：音高(仰角) / 音量(C/N0) / 声像(方位) / 呼吸(偏差) */
+  function updateVoice(prn, sat, dt, brDepth, med) {
+    const v = ensureVoice(prn);
+    const t = AU.ctx.currentTime;
+    const midi = midiOfEl(sat.el);
+    const f = mtof(midi);
+    if (!v.active) { v.osc.frequency.setValueAtTime(f, t); v.osc2.frequency.setValueAtTime(f * 2, t); }
+    else {
+      v.osc.frequency.setTargetAtTime(f, t, 0.28);        // 滑音，避免台阶感
+      v.osc2.frequency.setTargetAtTime(f * 2, t, 0.28);
+    }
+    v.pan.pan.setTargetAtTime(panOfAz(sat.az), t, 0.4);
+
+    // 慢均值（90 s）→ 偏差 → 呼吸速率与深度
+    if (v.slow == null) v.slow = sat.cn0;
+    v.slow += (sat.cn0 - v.slow) * (1 - Math.exp(-Math.max(0.001, dt) / 90));
+    const dev = Math.abs(sat.cn0 - v.slow);
+
+    const lv = levelOfCn(sat.cn0, med);
+    v.level = lv;
+    const tgt = Math.max(0.0002, lv);
+    if (!v.active) { v.env.gain.setValueAtTime(0.0001, t); }
+    v.env.gain.setTargetAtTime(tgt, t, v.active ? 0.55 : 1.6);
+    v.active = true;
+
+    // 音色亮度 = 绝对 C/N0（强弱直觉放在这里，不放在音量上）
+    const b = brightOfCn(sat.cn0);
+    v.g2.gain.setTargetAtTime(0.04 + b * 0.26, t, 0.5);
+    v.lp.frequency.setTargetAtTime(260 + b * 2900, t, 0.5);
+
+    // 记录本声部最近的 C/N0，用于挑出"抖得最厉害的那颗"当证据
+    v.hist.push(sat.cn0);
+    if (v.hist.length > 24) v.hist.shift();
+
+    const depth = Math.min(tgt * 0.75, (0.02 + dev * 0.05) * brDepth);
+    v.lfoG.gain.setTargetAtTime(depth, t, 0.6);
+    v.lfo.frequency.setTargetAtTime(0.35 + dev * 0.32, t, 0.8);
+
+    v.midi = midi; v.cn = sat.cn0; v.az = sat.az; v.el = sat.el;
+  }
+
+  /* 风铃：一声拨弦，音高由该星 C/N0 决定，声像跟它的方位 */
+  function chime(sat) {
+    if (!AU.on || !AU.ctx) return;
+    const t = AU.ctx.currentTime + 0.01;
+    const cn = Math.max(CN_MIN, Math.min(CN_MAX, sat.cn0));
+    const t2 = (cn - CN_MIN) / (CN_MAX - CN_MIN);
+    const idx = Math.round(t2 * (PENTA.length - 1));
+    const f = mtof(ROOT_MIDI + 12 + PENTA[idx]);           // 比合唱高一个八度
+    const out = AU.ctx.createGain();
+    out.gain.value = 0.0001;
+    const pan = AU.ctx.createStereoPanner();
+    pan.pan.value = panOfAz(sat.az);
+    out.connect(pan); pan.connect(AU.bus);
+
+    const parts = [[1, 1], [2.02, 0.32], [3.01, 0.14]];
+    const oscs = [];
+    parts.forEach(([mul, amp]) => {
+      const o = AU.ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f * mul;
+      const g = AU.ctx.createGain(); g.gain.value = amp;
+      o.connect(g); g.connect(out); o.start(t); o.stop(t + 3.2);
+      oscs.push(o);
+    });
+    const peak = 0.16 + t2 * 0.14;
+    out.gain.setValueAtTime(0.0001, t);
+    out.gain.exponentialRampToValueAtTime(peak, t + 0.008);
+    out.gain.exponentialRampToValueAtTime(0.0001, t + 2.4);
+    setTimeout(() => { try { pan.disconnect(); out.disconnect(); } catch (e) {} }, 3400);
+  }
+
+  /* ================= 状态 ================= */
+  const ST = {
+    sats: [],            // {sys,prn,az,el,cn0}
+    demo: false,
+    demoStars: [],
+    lastPoll: 0,
+    cap: 16, br: 0.45, chimeOn: true, chimeEvery: 2,
+    lastChime: 0, chimeIdx: 0,
+    medHist: [], varHist: [], varPrn: '--', varSwing: 0,
+    lastT: performance.now()
+  };
+
+  /* ---- 演示数据：合成 24 颗星，各自慢摆 ---- */
+  function initDemo() {
+    const sysList = ['G','G','G','B','B','E','R'];
+    ST.demoStars = [];
+    for (let i = 0; i < 24; i++) {
+      const sys = sysList[i % sysList.length];
+      ST.demoStars.push({
+        sys,
+        prn: sys + String(i + 1).padStart(2, '0'),
+        az: (i * 37 + 15) % 360,
+        el: 8 + (i * 29) % 80,
+        base: 22 + (i * 13) % 25,
+        p1: 8 + (i % 7) * 3.1,
+        p2: 15 + (i % 5) * 4.3,
+        ph1: i * 1.7, ph2: i * 2.9,
+        elRate: ((i % 5) - 2) * 0.004,
+        azRate: ((i % 7) - 3) * 0.006
+      });
+    }
+  }
+  function demoStep(dt) {
+    const now = performance.now() / 1000;
+    ST.sats = ST.demoStars.map(s => {
+      s.az = (s.az + s.azRate * dt + 360) % 360;
+      s.el = Math.max(3, Math.min(89, s.el + s.elRate * dt));
+      const w = Math.sin(now / s.p1 + s.ph1) * 2.6 + Math.sin(now / s.p2 + s.ph2) * 1.8;
+      return { sys: s.sys, prn: s.prn, az: s.az, el: s.el,
+               cn0: Math.max(6, Math.min(48, s.base + w)) };
+    });
+  }
+
+  async function poll() {
+    if (ST.demo) { ST.lastPoll = performance.now(); return; }
+    try {
+      const r = await fetch('/api/live', { cache: 'no-store' });
+      if (!r.ok) throw new Error('http ' + r.status);
+      const d = await r.json();
+      const sky = d.sky || [];
+      if (!sky.length) throw new Error('sky empty');
+      // ★ 跨轮次合并：GSV 偶有一拍少报几颗，直接覆盖会让声部闪断。
+      //   每颗星记住"最后一次被看到"的时刻，20 秒没再出现才真正退场。
+      const nowMs = performance.now();
+      if (!ST.live) ST.live = new Map();
+      sky.forEach(s => {
+        if (!s.prn) return;
+        ST.live.set(s.prn, { sys: s.sys, prn: s.prn, az: s.az, el: s.el, cn0: s.cn0, seen: nowMs });
+      });
+      ST.live.forEach((v, k) => { if (nowMs - v.seen > 12000) ST.live.delete(k); });
+      ST.sats = Array.from(ST.live.values());
+      ST.lastPoll = performance.now();
+      document.getElementById('chipSrc').innerHTML = '数据源 <b>板载实时</b>';
+    } catch (e) {
+      if (!ST.demo && !ST.manual) { ST.demo = true; initDemo(); syncDemoBtns(); }
+      else if (ST.demo) { initDemo(); }
+      document.getElementById('chipSrc').innerHTML = '数据源 <b>演示合成</b>';
+      ST.lastPoll = performance.now();
+    }
+  }
+
+  /* ---- 声部分配：不硬切，带 3 dB 滞回 ---- */
+  function assignVoices(now) {
+    const live = ST.sats.filter(s => s.cn0 >= CN_FLOOR);
+    const byPrn = new Map(live.map(s => [s.prn, s]));
+    const med = medianOf(live.map(s => s.cn0));
+
+    // 1) 掉线 / 太弱 → 记下"开始变弱"的时刻（4 秒后才真的回收，避免瞬断就切）
+    AU.voices.forEach(v => {
+      const s = byPrn.get(v.prn);
+      if (!s || s.cn0 < CN_FLOOR - 3) { if (!v.dyingSince) v.dyingSince = now; }
+      else v.dyingSince = 0;
+    });
+    // 2) 确认已走远的才回收
+    AU.voices.forEach(v => {
+      if (v.dyingSince && now - v.dyingSince > 4000) killVoice(v);
+    });
+
+    // 3) 排序依据：离中位数越远越优先（★ 极值才携带信息，中间那批几乎不动）
+    const score = s => Math.abs(s.cn0 - med);
+    let cur = [];
+    AU.voices.forEach(v => { const s = byPrn.get(v.prn); if (s) cur.push({ v, s }); });
+    cur.sort((a, b) => score(b.s) - score(a.s));
+
+    // 4) 超员 → 砍最接近中位数的（最"无聊"的）
+    while (cur.length > ST.cap) { const w = cur.pop(); killVoice(w.v); }
+    // 4b) 正在淡出的声部也算人头：超了就先砍它们，避免瞬时叠出一堆振荡器
+    if (AU.voices.size > ST.cap) {
+      const keep = new Set(cur.map(x => x.v.prn));
+      Array.from(AU.voices.values()).forEach(v => {
+        if (AU.voices.size > ST.cap && !keep.has(v.prn)) killVoice(v);
+      });
+    }
+
+    // 5) 空位补入
+    if (cur.length < ST.cap) {
+      const have = new Set(cur.map(x => x.s.prn));
+      const cand = live.filter(s => !have.has(s.prn)).sort((a, b) => score(b) - score(a));
+      for (const s of cand) {
+        if (cur.length >= ST.cap) break;
+        cur.push({ v: ensureVoice(s.prn), s });
+      }
+    }
+    return { cur, med };
+  }
+
+  /* ================= 主循环 ================= */
+  const dome = document.getElementById('dome');
+  const dctx = dome.getContext('2d');
+  const trMed = document.getElementById('trMed');
+  const trSum = document.getElementById('trSum');
+  let DPR = Math.min(2, window.devicePixelRatio || 1);
+
+  function fit(cv) {
+    const r = cv.getBoundingClientRect();
+    const w = Math.max(30, Math.round(r.width)), h = Math.max(30, Math.round(r.height));
+    if (cv.width !== Math.round(w * DPR) || cv.height !== Math.round(h * DPR)) {
+      cv.width = Math.round(w * DPR); cv.height = Math.round(h * DPR);
+    }
+    const g = cv.getContext('2d');
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    return { g, w, h };
+  }
+
+  function proj(az, el, cx, cy, R) {
+    const r = R * (1 - Math.max(0, Math.min(90, el)) / 90);
+    const a = (az || 0) * Math.PI / 180;
+    return { x: cx + r * Math.sin(a), y: cy - r * Math.cos(a) };
+  }
+
+  function drawDome(now) {
+    const { g, w, h } = fit(dome);
+    g.clearRect(0, 0, w, h);
+    const cx = w / 2, cy = h / 2, R = Math.min(w, h) * 0.44;
+
+    // 网格
+    g.strokeStyle = 'rgba(62,200,230,.13)'; g.lineWidth = 1;
+    [0.25, 0.5, 0.75, 1].forEach(k => {
+      g.beginPath(); g.arc(cx, cy, R * k, 0, 6.2832); g.stroke();
+    });
+    for (let a = 0; a < 360; a += 45) {
+      const p = proj(a, 0, cx, cy, R);
+      g.beginPath(); g.moveTo(cx, cy); g.lineTo(p.x, p.y); g.stroke();
+    }
+    // 方位字
+    g.fillStyle = 'rgba(120,170,190,.55)'; g.font = '10px monospace';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    [['N', 0], ['E', 90], ['S', 180], ['W', 270]].forEach(([t, a]) => {
+      const p = proj(a, -4, cx, cy, R);
+      g.fillText(t, p.x, p.y);
+    });
+
+    // 星
+    ST.sats.forEach(s => {
+      const p = proj(s.az, s.el, cx, cy, R);
+      const col = (SYS[s.sys] || SYS.G).color;
+      const live = s.cn0 >= CN_MIN;
+      const rad = 1.8 + Math.max(0, Math.min(1, (s.cn0 - CN_MIN) / (CN_MAX - CN_MIN))) * 5.2;
+      if (live) {
+        const v = AU.voices.get(s.prn);
+        const pulse = v && v.active ? 1 + 0.16 * Math.sin(now / 420 + p.x) : 1;
+        g.globalCompositeOperation = 'lighter';
+        const gl = g.createRadialGradient(p.x, p.y, 0, p.x, p.y, rad * 4.6 * pulse);
+        gl.addColorStop(0, hexA(col, 0.30));
+        gl.addColorStop(0.5, hexA(col, 0.09));
+        gl.addColorStop(1, hexA(col, 0));
+        g.fillStyle = gl;
+        g.beginPath(); g.arc(p.x, p.y, rad * 4.6 * pulse, 0, 6.2832); g.fill();
+        g.globalCompositeOperation = 'source-over';
+        if (v && v.active) {
+          g.strokeStyle = hexA(col, 0.5); g.lineWidth = 1;
+          g.beginPath(); g.arc(p.x, p.y, rad + 3.5, 0, 6.2832); g.stroke();
+        }
+      }
+      g.fillStyle = live ? col : 'rgba(120,160,180,.32)';
+      g.beginPath(); g.arc(p.x, p.y, rad * 0.62, 0, 6.2832); g.fill();
+      if (s.cn0 >= 32) {
+        g.fillStyle = 'rgba(200,232,242,.7)'; g.font = '9.5px monospace';
+        g.textAlign = 'left';
+        g.fillText(s.prn, p.x + rad + 2, p.y - rad * 0.4);
+      }
+    });
+  }
+
+  const hexCache = new Map();
+  function hexA(hex, a) {
+    const al = a < 0 ? 0 : (a > 1 ? 1 : a);
+    const q = (al * 1000) | 0, key = hex + q;
+    let s = hexCache.get(key);
+    if (s !== undefined) return s;
+    const n = parseInt(hex.slice(1), 16);
+    s = 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + (q / 1000) + ')';
+    if (hexCache.size > 3000) hexCache.clear();
+    hexCache.set(key, s);
+    return s;
+  }
+
+  function drawTrace(cv, arr, color, flat) {
+    const { g, w, h } = fit(cv);
+    g.clearRect(0, 0, w, h);
+    if (arr.length < 2) return;
+    const pad = 3;
+    // ★ 固定 5..50 dB 真实量程：不自适应缩放，平的就是平的、动多少就是多少
+    const lo = flat ? 5 : Math.max(5, Math.min.apply(null, arr) - 2);
+    const hi = flat ? 50 : Math.min(50, Math.max.apply(null, arr) + 2);
+    const span = Math.max(1, hi - lo);
+    const mid = (lo + hi) / 2;
+    g.strokeStyle = 'rgba(62,200,230,.10)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
+
+    g.beginPath();
+    arr.forEach((v, i) => {
+      const x = (i / Math.max(1, arr.length - 1)) * w;
+      const y = h - pad - ((v - (mid - span / 2)) / span) * (h - pad * 2);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.strokeStyle = color; g.lineWidth = 1.4; g.stroke();
+    g.lineTo(w, h); g.lineTo(0, h); g.closePath();
+    g.fillStyle = hexA(color, 0.07); g.fill();
+  }
+
+  function renderList(cur) {
+    const box = document.getElementById('voiceList');
+    const list = Array.from(AU.voices.values())
+      .filter(v => v.active)
+      .sort((a, b) => (b.cn || 0) - (a.cn || 0));
+    if (!list.length) {
+      box.innerHTML = '<div class="vrow idle"><span class="prn">--</span>' +
+        '<span class="nt">待发声</span></div>';
+      return;
+    }
+    box.innerHTML = list.map(v => {
+      const col = (SYS[(v.prn || 'G')[0]] || SYS.G).color;
+      const lv = Math.round(20 * Math.log10(Math.max(1e-5, v.level || 1e-5)));
+      const pct = Math.max(4, Math.min(100, (lv + 32) / 15 * 100));
+      return '<div class="vrow">' +
+        '<span class="dot" style="background:' + col + ';box-shadow:0 0 6px ' + col + '"></span>' +
+        '<span class="prn">' + v.prn + '</span>' +
+        '<span class="nt">' + (v.midi != null ? noteName(v.midi) : '--') + '</span>' +
+        '<span class="bar"><i style="width:' + pct.toFixed(0) + '%"></i></span>' +
+        '<span class="lv">' + (v.cn != null ? v.cn.toFixed(0) : '--') + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.25, (now - ST.lastT) / 1000);
+    ST.lastT = now;
+
+    if (ST.demo) demoStep(dt);
+
+    // 实时模式每 2 s 拉一次
+    if (now - ST.lastPoll > 2000) { ST.lastPoll = now; poll(); }
+
+    // 声部
+    if (AU.on) {
+      const asg = assignVoices(now);
+      asg.cur.forEach(({ s }) => updateVoice(s.prn, s, dt, ST.br, asg.med));
+
+      const tSec = now / 1000;
+      if (!ST._lastEv || tSec - ST._lastEv >= 1) {
+        ST._lastEv = tSec;
+
+        // 证据①：全体中位数 —— 一条直线
+        ST.medHist.push(asg.med);
+        if (ST.medHist.length > 120) ST.medHist.shift();
+
+        // 证据②：挑出最近摆幅最大的那颗 —— 一直在动
+        let best = null, bestSw = -1;
+        AU.voices.forEach(v => {
+          if (!v.active || v.hist.length < 5) return;
+          const sw = Math.max.apply(null, v.hist) - Math.min.apply(null, v.hist);
+          if (sw > bestSw) { bestSw = sw; best = v; }
+        });
+        if (best) {
+          ST.varHist.push(best.cn);
+          ST.varPrn = best.prn;
+          ST.varSwing = bestSw;
+          if (ST.varHist.length > 120) ST.varHist.shift();
+        }
+        const eMed = document.getElementById('tMed');
+        if (eMed) eMed.textContent = asg.med ? asg.med.toFixed(0) : '--';
+        const eV = document.getElementById('tVar');
+        if (eV) eV.textContent = best ? best.cn.toFixed(0) : '--';
+        const eP = document.getElementById('tVarPrn');
+        if (eP) eP.textContent = ST.varPrn || '--';
+        const eS = document.getElementById('tSwing');
+        if (eS) {
+          const t = ST.varHist.slice(-24);
+          eS.textContent = t.length > 3
+            ? (Math.max.apply(null, t) - Math.min.apply(null, t)).toFixed(0)
+            : '--';
+        }
+      }
+      // 风铃
+      if (ST.chimeOn && ST.chimeEvery > 0) {
+        const el = (now - ST.lastChime) / 1000;
+        if (el >= ST.chimeEvery) {
+          ST.lastChime = now;
+          const pool = ST.sats.filter(s => s.cn0 >= CN_MIN);
+          if (pool.length) {
+            const s = pool[(ST.chimeIdx++) % pool.length];
+            chime(s);
+          }
+        }
+      }
+      document.getElementById('chipVoices').innerHTML =
+        '声部 <b>' + AU.voices.size + '</b>';
+    }
+
+    drawDome(now);
+    drawTrace(trMed, ST.medHist, '#4fd1ff', true);
+    drawTrace(trSum, ST.varHist, '#7cf0c0', false);
+    renderList();
+
+    requestAnimationFrame(loop);
+  }
+
+  /* ================= 交互 ================= */
+  function syncDemoBtns() {
+    document.querySelectorAll('#segDemo button').forEach(b => {
+      b.classList.toggle('on', (b.dataset.demo === '1') === ST.demo);
+    });
+  }
+
+  document.getElementById('go').addEventListener('click', async () => {
+    initAudio();
+    if (AU.ctx.state !== 'running') { try { await AU.ctx.resume(); } catch (e) {} }
+    AU.on = !AU.on;
+    const b = document.getElementById('go');
+    b.textContent = AU.on ? '停 止 发 声' : '开 始 发 声';
+    b.classList.toggle('playing', AU.on);
+    if (!AU.on) {
+      AU.voices.forEach(v => killVoice(v));
+    }
+  });
+
+  const bind = (id, valId, fn, fmt) => {
+    const s = document.getElementById(id), v = document.getElementById(valId);
+    const upd = () => { const x = +s.value; fn(x); v.textContent = fmt ? fmt(x) : x; };
+    s.addEventListener('input', upd); upd();
+  };
+  bind('sVol', 'vVol', x => {
+    if (AU.master) AU.master.gain.value = (x / 100) * 1.1;
+    if (!AU.master) ST._vol = x / 100;
+  });
+  bind('sRev', 'vRev', x => { if (AU.wet) AU.wet.gain.value = (x / 100) * 0.9; });
+  bind('sCap', 'vCap', x => { ST.cap = x; });
+  bind('sBr', 'vBr', x => { ST.br = (x / 100) * 1.6; });
+  bind('sCh', 'vCh', x => {
+    ST.chimeEvery = x; ST.chimeOn = x > 0;
+  }, x => x ? x + 's' : '关');
+
+  document.querySelectorAll('#segCh button').forEach(b => {
+    b.addEventListener('click', () => {
+      ST.chimeOn = b.dataset.on === '1';
+      document.querySelectorAll('#segCh button').forEach(x => x.classList.toggle('on', x === b));
+    });
+  });
+  document.querySelectorAll('#segDemo button').forEach(b => {
+    b.addEventListener('click', () => {
+      ST.demo = b.dataset.demo === '1';
+      ST.manual = true;
+      if (ST.demo) initDemo();
+      ST.medHist.length = 0; ST.varHist.length = 0;
+      syncDemoBtns();
+    });
+  });
+
+  window.addEventListener('resize', () => { DPR = Math.min(2, window.devicePixelRatio || 1); });
+
+  /* 启动 */
+  window.__SC = { AU, ST, SYS, midiOfEl, noteName };     // 供诊断用
+  initDemo();
+  poll();
+  if (/[?&]autostart=1/.test(location.search)) {
+    setTimeout(() => document.getElementById('go').click(), 300);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

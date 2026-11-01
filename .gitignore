@@ -23,3 +23,9 @@ esptool.exe
 
 # 串口日志
 *.log
+
+# 看板：运行时布局存档与验证产物
+tools/dashboard/layout.json
+tools/dashboard/verify/out/
+tools/dashboard/verify/node_modules/
+tools/dashboard/out/

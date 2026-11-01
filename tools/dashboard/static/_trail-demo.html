@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>卫星轨迹平滑 · 3600x 验证</title>
+<style>
+  html,body{margin:0;height:100%;background:#050d14;color:#cfeaf5;
+    font:13px/1.6 "JetBrains Mono",Consolas,monospace;overflow:hidden}
+  #c{display:block;width:100%;height:100%}
+  #hud{position:fixed;left:16px;top:12px;font-size:12px;color:#8fb6c8;pointer-events:none}
+  #hud b{color:#e6f9ff;font-weight:400}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+const SPEED = 3600;        // 3600 倍速
+const STEP  = 30;          // 每 30 模拟秒采一点（与看板一致）
+const N     = 130;         // 130 点 = 65 分钟
+const WIN   = STEP * N;    // 3900 s
+const D2R   = Math.PI / 180;
+let R = 250;
+
+function proj(az, el, cx, cy) {
+  const r = R * (1 - Math.max(0, Math.min(90, el)) / 90);
+  return { x: cx + r * Math.sin(az * D2R), y: cy - r * Math.cos(az * D2R) };
+}
+
+/* 7 颗模拟星：速度取 GPS 量级（0.004~0.010 °/s），方位略快于仰角 */
+const stars = [];
+for (let i = 0; i < 7; i++) {
+  stars.push({
+    az: 25 + i * 47, el: 22 + (i % 3) * 20,
+    azR: 0.0045 + 0.0030 * (i % 4),
+    elR: 0.0028 + 0.0022 * (i % 3),
+    raw: [], sm: [], acc: 0, taz: 0, tel: 0, qaz: 0, qel: 0
+  });
+}
+stars.forEach(s => { s.taz = s.az; s.tel = s.el; s.qaz = Math.round(s.az); s.qel = Math.round(s.el); });
+
+let simT = 0, last = 0;
+
+function step(dts) {
+  simT += dts;
+  for (const s of stars) {
+    // —— 真实（连续）位置 ——
+    s.az = (s.az + s.azR * dts + 360) % 360;
+    s.el = Math.max(-3, Math.min(88, s.el + s.elR * dts));
+
+    // —— 左：模拟 GSV 只给整数度 ——
+    s.qaz = Math.round(s.az);
+    s.qel = Math.round(s.el);
+
+    // —— 右：轨迹专用 45 s 低通 ——
+    const kT = 1 - Math.exp(-dts / 45);
+    let d = s.az - s.taz;
+    if (d > 180) d -= 360; else if (d < -180) d += 360;
+    s.taz = (s.taz + d * kT + 360) % 360;
+    s.tel += (s.el - s.tel) * kT;
+
+    s.acc += dts;
+    while (s.acc >= STEP) {
+      s.acc -= STEP;
+      s.raw.push({ az: s.qaz, el: s.qel });
+      if (s.raw.length > N) s.raw.shift();
+      s.sm.push({ az: s.taz, el: s.tel });
+      if (s.sm.length > N) s.sm.shift();
+    }
+  }
+}
+
+function dome(cx, cy, label, sub) {
+  ctx.strokeStyle = 'rgba(62,200,230,.16)'; ctx.lineWidth = 1;
+  for (const el of [0, 30, 60]) {
+    const r = R * (1 - el / 90);
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 6.2832); ctx.stroke();
+  }
+  ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.stroke();
+  ctx.fillStyle = 'rgba(159,232,255,.85)';
+  ctx.font = '13px "JetBrains Mono",monospace'; ctx.textAlign = 'center';
+  ctx.fillText(label, cx, cy + R + 32);
+  ctx.fillStyle = 'rgba(120,160,178,.8)'; ctx.font = '11px "JetBrains Mono",monospace';
+  ctx.fillText(sub, cx, cy + R + 50);
+}
+
+function trail(hist, cx, cy, col, smooth) {
+  const n = hist.length;
+  if (n < 3) return;
+  const pts = hist.map(h => proj(h.az, h.el, cx, cy));
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  if (!smooth) {
+    for (let k = 1; k < n; k++) {
+      const u = k / n;
+      ctx.strokeStyle = rgba(col, Math.pow(u, 1.7) * 0.85);
+      ctx.lineWidth = 0.5 + u * 2.4;
+      ctx.beginPath(); ctx.moveTo(pts[k-1].x, pts[k-1].y); ctx.lineTo(pts[k].x, pts[k].y); ctx.stroke();
+    }
+  } else {
+    for (let k = 1; k < n - 1; k++) {
+      const a = pts[k-1], b = pts[k], d = pts[k+1], u = k / n;
+      ctx.strokeStyle = rgba(col, Math.pow(u, 1.7) * 0.85);
+      ctx.lineWidth = 0.5 + u * 2.4;
+      ctx.beginPath();
+      ctx.moveTo((a.x + b.x) / 2, (a.y + b.y) / 2);
+      ctx.quadraticCurveTo(b.x, b.y, (b.x + d.x) / 2, (b.y + d.y) / 2);
+      ctx.stroke();
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+const rcache = new Map();
+function rgba(hex, a) {
+  const q = Math.max(0, Math.min(1000, (a * 1000) | 0));
+  const k = hex + q;
+  let v = rcache.get(k); if (v) return v;
+  const n = parseInt(hex.slice(1), 16);
+  v = 'rgba(' + ((n>>16)&255) + ',' + ((n>>8)&255) + ',' + (n&255) + ',' + (q/1000) + ')';
+  rcache.set(k, v); return v;
+}
+
+const hud = document.getElementById('hud');
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  R = Math.min(H * 0.34, W * 0.18);
+  const cy = H * 0.46;
+  const cx1 = W * 0.26, cx2 = W * 0.74;
+
+  dome(cx1, cy, '直接采点连线（现状）', '整数度 → 折角');
+  dome(cx2, cy, '低通 + 曲线平滑（改后）', '45 s 低通 + 中点贝塞尔');
+
+  for (const s of stars) trail(s.raw, cx1, cy, '#3ee0ff', false);
+  for (const s of stars) trail(s.sm,  cx2, cy, '#2fe08a', true);
+
+  // 当前真实位置（星点本身）
+  for (const s of stars) {
+    const p = proj(s.az, s.el, cx2, cy);
+    ctx.fillStyle = '#eaffff';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2.4, 0, 6.2832); ctx.fill();
+  }
+
+  const pct = Math.min(1, simT / WIN);
+  hud.innerHTML = '倍速 <b>' + SPEED + 'x</b>　模拟时间 <b>' +
+    (simT / 60).toFixed(0) + ' min</b> / ' + (WIN / 60) + ' min　采样间隔 <b>' + STEP +
+    ' s</b>　每星 <b>' + N + ' 点</b>';
+}
+
+function frame(now) {
+  if (!last) last = now;
+  const dtr = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (simT < WIN) step(Math.min(dtr * SPEED, WIN - simT));
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
