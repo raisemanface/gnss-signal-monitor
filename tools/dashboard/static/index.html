@@ -2895,10 +2895,13 @@ table.sat tr:hover td{background:rgba(62,200,230,.05)}
     live: new Map(),          // prn -> {prn,sys,az,el,cn,seen}（GSV 偶尔少报，12 s 才退场）
     st: new Map(),            // prn -> 敲击状态 {sm,curMidi,pend,pendAt,lastStrike,at,midi,cn,sys,az}
     hist: new Map(),          // prn -> [{t, cn, s}]  24 s 轨迹
+    miss: new Map(),          // prn -> 首次发现"点选了但不在报数据"的时刻（幽灵声部计时）
+    armed: false,             // 是否已收到过真实数据（收到后才开始判幽灵，避免刷新即清空）
     sampleAt: 0, lastAny: 0
   };
   const SV_HYST = 0.8;                              // 换音门槛（dB）
   const SV_DB_SEMI = (SON.hi - SON.lo) / 24;        // 1.25 dB/半音（2 八度）
+  const SV_MISS_MS = 60000;                         // 点选了却连续这么久没有 C/N0 -> 摘掉
 
   /* 每轮 poll 喂一次（applySats 末尾）。不直接覆盖已退场：延迟退场防闪断。 */
   function sonFeed(list) {
@@ -2910,12 +2913,33 @@ table.sat tr:hover td{background:rgba(62,200,230,.05)}
     SV.live.forEach((v, k) => { if (now - v.seen > 12000) SV.live.delete(k); });
     const b = el('sonBody');
     if (b && SV.live.size) b.classList.remove('nodata');   // 摘掉"等 C/N0 数据"空态遮罩
+
+    // ★ v16.2 幽灵声部：存档里的点选是"上次那些星"，重启后它们可能早已落下地平线。
+    //   所以① 要等第一帧真实数据到手才开始判（否则一刷新就把点选清光）；
+    //        ② 某颗星连续 SV_MISS_MS 不再报 C/N0，就从点选表摘掉并写回存档。
+    //   不摘的话，08 会一直显示"8 个声部在唱"，而天球上只剩 2 颗有光环。
+    if (SV.live.size) SV.armed = true;
+    if (!SV.armed) return;
+    let dropped = false;
+    SON.picked.slice().forEach(prn => {
+      if (SV.live.has(prn)) { SV.miss.delete(prn); return; }
+      let t0 = SV.miss.get(prn);
+      if (t0 == null) { t0 = now; SV.miss.set(prn, t0); }
+      if (now - t0 > SV_MISS_MS) {
+        SV.miss.delete(prn);
+        const i = SON.picked.indexOf(prn);
+        if (i >= 0) SON.picked.splice(i, 1);
+        dropped = true;
+      }
+    });
+    if (dropped) { svSync(); sonSavePrefs(); }
   }
 
   /* 点选表变化：敲击状态与点选对齐（移除的星连状态一起清，轨迹线自然淡出） */
   function svSync() {
     const want = new Set(SON.picked);
     SV.st.forEach((v, prn) => { if (!want.has(prn)) SV.st.delete(prn); });
+    SV.miss.forEach((v, prn) => { if (!want.has(prn)) SV.miss.delete(prn); });
   }
 
   function svStrike(prn, v, m, now) {
@@ -3117,20 +3141,22 @@ table.sat tr:hover td{background:rgba(62,200,230,.05)}
 
   function sonDrawReadout() {
     const a = el('sonCn'); if (!a) return;
-    const n = SON.picked.length;
-    /* 读数 = 点选各星 C/N0 的中位（一颗时就是它自己）；无点选显示 -- */
+    const total = SON.picked.length;
+    /* 只把"此刻真的在报 C/N0"的星算作在唱。点选表里的旧星可能早已落下地平线，
+       计数要是还给 total，就会出现"天球 2 颗、面板说 8 颗"的鬼话。 */
+    const cns = [];
+    SON.picked.forEach(prn => { const s = SV.live.get(prn); if (s) cns.push(s.cn); });
+    const n = cns.length;                           // 在唱声部数
+    /* 读数 = 在唱各星 C/N0 的中位（一颗时就是它自己）；一颗都没在报显示 -- */
     let med = null;
-    if (n) {
-      const cns = [];
-      SON.picked.forEach(prn => { const s = SV.live.get(prn); if (s) cns.push(s.cn); });
-      if (cns.length) { cns.sort((x, y) => x - y); med = cns[Math.floor(cns.length / 2)]; }
-    }
+    if (n) { cns.sort((x, y) => x - y); med = cns[Math.floor(n / 2)]; }
     a.textContent = med != null ? med.toFixed(1) : '--';
     const u = el('sonUnit'); if (u) u.textContent = 'dB-Hz';
     const nt = el('sonNote');
-    if (nt) { nt.className = 'snote ch'; nt.textContent = n ? '♪ ' + n : '--'; }
+    // 还有没落地的旧点选时显示"在唱/点选"（如 2/8），被自动摘掉后回到 2
+    if (nt) { nt.className = 'snote ch'; nt.textContent = n ? '♪ ' + n + (total > n ? '/' + total : '') : '--'; }
     const so = el('sonSolf');
-    if (so) { so.className = 'ssolf ch'; so.textContent = n ? 'PICKED' : 'IDLE'; }
+    if (so) { so.className = 'ssolf ch'; so.textContent = n ? 'PICKED' : (total ? 'WAIT' : 'IDLE'); }
     const fr = el('sonFreq');
     if (fr) fr.textContent = SON.power && n ? 'AUDIBLE' : '';
   }
@@ -3245,8 +3271,10 @@ table.sat tr:hover td{background:rgba(62,200,230,.05)}
         const prn = sonHitStar(e);
         if (!prn) return;
         const i = SON.picked.indexOf(prn);
-        if (i >= 0) SON.picked.splice(i, 1);
+        if (i >= 0) { SON.picked.splice(i, 1); SV.miss.delete(prn); }
         else {
+          // 名额满了先摘掉"已经不在报数据"的旧点选（重启后常见的幽灵），别让它们占坑
+          if (SON.picked.length >= 8) SON.picked = SON.picked.filter(p => SV.live.has(p));
           if (SON.picked.length >= 8) return;
           SON.picked.push(prn);
         }
