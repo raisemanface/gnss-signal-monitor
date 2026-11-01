@@ -118,11 +118,13 @@ constexpr uint16_t CLR_ERR  = TFT_RED;
 constexpr uint16_t CLR_SELB = TFT_CYAN; // 选中态左侧指示条
 constexpr uint16_t kGrey    = 0x8410;   // TFT_eSPI 本配置没定义 TFT_GREY,本地给
 
-// 顶栏 + WiFi 图标(RF_Source_Controller 那套:4 段弧,半径 1/5/9/13,朝上 135~225°)
-constexpr int BAR_H  = 24;
-constexpr int ICON_X = 210;   // 图标左上角 x(宽 26,贴右留 4)
-constexpr int ICON_Y = 4;
-constexpr int ICON_H = 16;
+// 顶栏 + WiFi 图标(★ 2026-10-31:整套照 S3 的 wifiIconPaint 搬过来 —— 形状/半径/配色一致)
+//   4 段同心朝上弧,半径 2/5/8/11、厚 1px,弧心即图标**底端**;占 22(宽)×11(高)。
+//   原 C3 用的是半径 1/5/9/13(间距 4),比 S3 更"开"、整体也大一圈 —— 用户看出来了,统一掉。
+constexpr int BAR_H   = 24;
+constexpr int ICON_MR = 11;                             // 最大弧半径 ⇒ 图标 22x11(与 S3 同尺寸)
+constexpr int ICON_CX = SCR_W - 4 - ICON_MR;            // 225:弧心 x,图标右端落在 236(留 4px)
+constexpr int ICON_CY = 4 + (16 + ICON_MR) / 2;         // 17:弧心 y = 图标底端,半圆在顶栏内垂直居中
 
 // ============================================================================
 //  触摸:4 点校准 + 存 NVS
@@ -339,6 +341,22 @@ static bool     trOn  = false;       // true = 正在从 #1 往 #trN 挨个试
 static int      trN   = 0;           // 本次要试到第几条(1 起算)
 static int      trIdx = 0;           // 当前正试第几条
 static volatile uint8_t evFast = 0;  // 事件回调置的"快失败"reason(201/202),poll() 里消费
+static volatile uint8_t evLost = 0;  // ★ v1.2.13:非连接期的掉线 reason(0=无),poll() 里消费
+static bool     linked  = false;     // ★ v1.2.13:上一轮 poll 认为"当前是连着的"
+static bool     trQuiet = false;     // ★ v1.2.13:后台自动重连 = 静默(不往输出卡刷 TRY 进度)
+
+// ★★ v1.2.13:断线自动重连看门狗 —— 用户 2026-10-31 现场报的缺陷
+// ----------------------------------------------------------------------------
+//   现象:输出卡明明有过 `[C3] IP 192.168.2.102`,可顶栏图标一直灰、状态行 IP 位是 `--`。
+//   根因:连上过一次,后来掉了;**核心自动重连是关着的**(见 radioIdleForScan 那段:
+//     开着它,`disconnect()` 会被核心立刻又 `connect()` 回去,扫描永远 -2),
+//     而固件里**没有任何重试循环** ⇒ 一次掉线 = 此后永久离线,直到人工再点一次。
+//   治法:后台静默巡台账。条件很严 —— 有台账 ∧ 未连 ∧ 没在连 ∧ 没在巡 ∧ 没在扫;
+//     退避 15s→30→60→120→300s 封顶;每次失败都 radioOff(),不空转费电。
+//   ⚠ 为什么不扫描:用户 2026-10-12 定"有台账就按台账试,别人工自己扫",这条不动。
+static uint32_t tWdtLast = 0;        // 上次自动重连(或连上)的时刻
+static uint32_t wdtBack  = 15000;    // 当前退避间隔 ms
+constexpr uint32_t kWdtMax = 300000;
 
 // ★★ v0.8.2 射频档位(详见文件头 v0.8.2 段)
 // ----------------------------------------------------------------------------
@@ -412,6 +430,10 @@ static void onWifiEvt(arduino_event_id_t id, arduino_event_info_t info) {
     //   这两种再等满 10 s 纯属浪费 —— 巡视台账时直接跳下一条(移植自 S3 v1.5.19)。
     const uint8_t fr = (uint8_t)info.wifi_sta_disconnected.reason;
     if (csBusy && (fr == 201 || fr == 202)) evFast = fr;
+    // ★ v1.2.13:不是我们在连的时候掉的线 —— 记下原因码,回主循环再上屏。
+    //   ⚠ 回调跑在 WiFi 事件任务里,**不能**在这里碰 evtQ / 屏(数据竞争),
+    //     所以只写一个 volatile 字节,由 poll() 消费。
+    if (!csBusy) evLost = fr;
   }
 }
 
@@ -521,6 +543,7 @@ static void startConnect(const char* ssid, const char* pass) {
   WiFi.begin(ssid, pass);
   wifiUp = true;
   csBusy = true;
+  linked = false;                 // ★ v1.2.13:新一轮连接开始,先撤销"连着"的认定
   csT0   = millis();
   csBeat = millis();              // ★ v0.8.2:心跳起点
   snprintf(csSsid, sizeof(csSsid), "%s", ssid);
@@ -531,7 +554,7 @@ static void startConnect(const char* ssid, const char* pass) {
 }
 
 static void scanStart(bool forBoot);     // 定义在本段之后(★ v0.8.7 起开机不再走它)
-static void tryAll(int n);               // 定义在 connIdx 之后(begin() 要用它)
+static void tryAll(int n, bool quiet = false);   // 定义在 connIdx 之后(begin() 要用它)
 
 inline void begin() {                    // 开机:载入台账 -> **按台账顺序挨个试**(不扫描)
   WiFi.setAutoReconnect(false);          // ★ 关掉核心自动重连(默认 true,见 radioIdleForScan)
@@ -589,13 +612,14 @@ static void connFailed(const char* why) {
     ++trIdx;
     char b[48];
     snprintf(b, sizeof(b), "WIFI TRY %d/%d %.16s", trIdx, trN, list[trIdx - 1].ssid);
-    queueEvt(b);
+    if (!trQuiet) queueEvt(b);                     // ★ v1.2.13:后台重连不刷屏
     connIdx(trIdx);
     return;
   }
   if (trOn) {                                      // 台账全试完,一个都没成
     trOn = false;
-    queueEvt("WIFI FAIL ALL");
+    if (!trQuiet) queueEvt("WIFI FAIL ALL");
+    trQuiet = false;
     Serial.println("[c3] wifi: try: ALL FAILED -> stay offline");
   } else {
     // ★ v0.9:分两行 —— 第一行"谁失败了",第二行"为什么"(原因才是用户要看的那条)
@@ -615,15 +639,19 @@ static void connFailed(const char* why) {
 }
 
 // 巡台账入口:n = 试到第几条(1 起算);n <= 0 或超界 = 试全部
-static void tryAll(int n) {
+//   ★ v1.2.13:quiet = 后台自动重连触发 —— 不往输出卡刷 "WIFI TRY k/n"(用户没按任何键,
+//     屏幕不该自己滚),串口日志照旧;连上的 "WIFI OK / IP" 仍然发,那是他该知道的好消息。
+static void tryAll(int n, bool quiet) {
   if (!cnt) { Serial.println("[c3] wifi: try: none saved"); return; }
   if (n < 1 || n > cnt) n = cnt;
-  trOn = true; trN = n; trIdx = 1;
+  trOn = true; trN = n; trIdx = 1; trQuiet = quiet;
   char b[48];
-  snprintf(b, sizeof(b), "WIFI TRY %d/%d %s", trIdx, trN, list[0].ssid);
-  queueEvt(b);
-  Serial.printf("[c3] wifi: try: %d entr%s, start with #1 \"%s\"\n",
-                trN, trN == 1 ? "y" : "ies", list[0].ssid);
+  if (!quiet) {
+    snprintf(b, sizeof(b), "WIFI TRY %d/%d %s", trIdx, trN, list[0].ssid);
+    queueEvt(b);
+  }
+  Serial.printf("[c3] wifi: try: %d entr%s, start with #1 \"%s\"%s\n",
+                trN, trN == 1 ? "y" : "ies", list[0].ssid, quiet ? " (auto-reconnect)" : "");
   connIdx(1);
 }
 
@@ -707,6 +735,8 @@ static int pickBestStored() {
 }
 
 // 主循环每圈调一次(挂在 ui::tick 里)
+static void wdtPoll();      // ★ v1.2.13:定义在 poll() 之后(见断线看门狗那段)
+
 static void poll() {
   // ---- ① "连上才存" ----
   if (csBusy) {
@@ -729,6 +759,9 @@ static void poll() {
       queueEvt(b);
       Serial.printf("[c3] wifi: CONNECTED \"%s\" ip=%s -> saved front (%d/%d)\n",
                     csSsid, WiFi.localIP().toString().c_str(), cnt, kMax);
+      // ★ v1.2.13:连上就把看门狗的退避与计时归零(下次断线重新从 15s 起算)
+      tWdtLast = millis(); wdtBack = 15000;
+      linked = true;
     } else if (millis() - csT0 > kConnMs) {
       connFailed("TIMEOUT 10s");                 // ★ v0.8.7:统一收口,自动跳下一条
     } else if (millis() - csBeat >= 2000) {
@@ -765,6 +798,32 @@ static void poll() {
     }
     radioOff();                       // 没连上就关射频(csBusy 时内部跳过)
   }
+
+  // ---- ③ 断线自动重连(★ v1.2.13 新增,见常量旁长注)----
+  //   ★ 先把"掉了"这件事上屏 —— 这台 C3 的串口控制台走 HWCDC(没引出),
+  //     硬盘上看不到 Serial 里那行 reason,屏是唯一能看到断线原因的地方。
+  if (evLost) {
+    const uint8_t r = evLost; evLost = 0;
+    if (linked) {                                  // 只在"确实连着过"时报,避免杂散事件刷屏
+      linked = false;
+      char b[48];
+      snprintf(b, sizeof(b), "WIFI LOST r=%u %.16s", (unsigned)r, wifiReasonName(r));
+      queueEvt(b);
+    }
+  }
+  wdtPoll();
+}
+
+// ★ v1.2.13:断线看门狗 —— 只在"有台账 ∧ 未连 ∧ 没在连 ∧ 没在巡 ∧ 没在扫"时出手。
+//   静默(lenient):不刷 "WIFI TRY",不弹告警;失败就 radioOff(),按退避等下一轮。
+static void wdtPoll() {
+  if (!cnt) return;
+  if (csBusy || trOn || scWaiting) return;
+  if (WiFi.status() == WL_CONNECTED) { tWdtLast = millis(); wdtBack = 15000; return; }
+  if (millis() - tWdtLast < wdtBack) return;      // 退避未到
+  tWdtLast = millis();
+  wdtBack  = (wdtBack >= kWdtMax / 2) ? kWdtMax : wdtBack * 2;
+  tryAll(cnt, true);
 }
 
 static void cmd(const char* args) {           // 'w' 之后的子命令串
@@ -1234,7 +1293,29 @@ constexpr const char* kSub2  = "STUDIO";
 //   ★ v1.2.10(2026-10-24 晨二,用户:"呼吸灯还是太快,半周期从一秒延长到两秒"):
 //     呼吸周期 3000→**4000 ms**(kLedPeriodMs;gamma/谷值/颜色全不动,只动节拍);
 //     顺带更正 boot 横幅里漏改的"呼吸 2s"(A13 改 3s 时该处没跟上,现在 4s)。
-constexpr const char* kVer   = "v1.2.11";
+//   ★ v1.2.12(2026-10-31,用户:"C3 的 wifi 图标和 S3 的不一样,把 S3 的抄过来"):
+//     WiFi 图标整套对齐 S3 的 wifiIconPaint —— 只要**外观**,算法本来就同源。
+//       · 颜色:`TFT_CYAN` → `0x064A`(#00CB52 翠绿,未连 `0x4208` 深灰),与 S3 逐位相同;
+//       · 半径:1/5/9/13(间距 4,占 26x13)→ **2/5/8/11**(间距 3,占 22x11),同 S3;
+//       · 弧心:原来 `cx=ICON_X+8` 让半径 13 的弧左溢 5px,改成按右端反推(cx=225/cy=17);
+//       · 档位计算从 `drawWifiIcon()` 里**拆出**(`wifiTierTick()`),只在 tick 的 1 Hz 段推进 ——
+//         原写法每次重画都推一次 EMA 与滞回,加档速度翻倍。
+//   ★ v1.2.13(2026-10-31 午二,用户:"wifi ip 怎么没有显示出来?wifi 图标怎么没有亮起来?"):
+//     现场三件事,一因一果:
+//       ① 输出卡里明明有过 `[C3] IP 192.168.2.102` ⇒ **连上过**,不是没配网;
+//       ② 顶栏图标灰 + 状态行 IP 位是 `--` ⇒ 此刻**未连接**;
+//       ③ 根因:**连上后又掉了,而固件不会自己回来** —— `WiFi.setAutoReconnect(false)`
+//          (见 radioIdleForScan:开着它 `disconnect()` 会被核心立刻 connect 回去,扫描永远 -2),
+//          可固件里**没有任何重试循环** ⇒ 一次掉线 = 此后永久离线,直到人工再点一次。
+//     改法:
+//       a) **断线看门狗 `wdtPoll()`** —— 有台账 ∧ 未连 ∧ 没在连/巡/扫 时,静默巡一遍台账;
+//          退避 15→30→60→120→300 s 封顶,每次失败 radioOff()(不空转费电),连上即归零。
+//          静默 = 不往输出卡刷 `WIFI TRY k/n`(用户没按键,屏不该自己滚),也不弹整屏告警。
+//       b) **把掉线原因上屏** —— `WIFI LOST r=<码> <原因>`。这台 C3 的控制台走 HWCDC
+//          (板子没引出),Serial 里那行 reason 谁也看不到,屏是唯一出口。
+//          事件回调跑在 WiFi 任务里 ⇒ 只写 volatile `evLost`,由 poll() 上屏(不跨任务碰屏)。
+//       c) 状态行未连时 `--` → **`NO-WIFI`**(`--` 太含糊,用户就是这么误会的)。
+constexpr const char* kVer   = "v1.2.13";
 
 constexpr uint32_t kExpandMs = 5000;    // 展开时间下限(与 S3 同)
 constexpr uint32_t kHoldMs   = 2000;    // 定格(与 S3 同)
@@ -1632,7 +1713,7 @@ static char     lastPayload[96] = "";     // RESEND 键:记住最近一条发往
 // ============================================================================
 // ---- ★ 2026-10-30:信号档位(1..4 段),与 S3 **同一套门限与滞回** ----
 //   原实现只判"连没连上",4 段弧恒定全画 —— 信号再差也显示满格。
-//   C3 这一版暂不烧录;改动与 S3 对称,哪天烧上去两边视觉才一致。
+//   ★ 2026-10-31 已烧录并核对:外观与 S3 逐像素同款(v1.2.12)。
 //   门限:-50 / -65 / -75,-85 以下但还连着 → 1 段。
 //   滞回:升档 +3 dB、降档 -3 dB(理由见 S3 侧同名函数那段注释:RSSI 抖动 ±3~5 dB)。
 static int8_t  c3IconBars  = -1;
@@ -1650,32 +1731,33 @@ static int8_t c3WifiBarsHyst(int rssi, int8_t prev) {
 }
 
 static void drawWifiIcon(uint16_t bg) {
-  const bool     up    = (WiFi.status() == WL_CONNECTED);
-  const uint16_t color = up ? TFT_CYAN : TFT_DARKGREY;
-  // tick() 每秒调一次本函数 —— 档位就在这里推进(带滞回)。
-  //   drawTopBar() 等处也会调,多算几次无害:prev 已更新,raw == prev 直接返回。
-  //   ★ 与 S3 同款:先 EMA 平滑(α=1/5,1 Hz 下 τ≈5 s)再分档 ——
-  //     实测 S3 那付天线瞬时 RSSI 波动可达 7 dB,只靠滞回图标仍会闪。
-  if (up) {
-    const int rs = (int)WiFi.RSSI();
-    if (c3RssiEma10 == 0) c3RssiEma10 = rs * 10;
-    else                  c3RssiEma10 += (rs * 10 - c3RssiEma10) / 5;
-    const int sm = (c3RssiEma10 + 5) / 10;               // 四舍五入回 dBm
-    c3IconBars = c3WifiBarsHyst(sm, c3IconBars);
-  } else {
+  const bool     up  = (WiFi.status() == WL_CONNECTED);
+  // 与 S3 完全同色:0x064A = #00CB52 翠绿(已连)/ 0x4208 深灰(未连)
+  const uint16_t col = up ? 0x064A : 0x4208;
+  // ★ 2026-10-31:档位不再在这里算 —— 只读 wifiTierTick() 1 Hz 写好的 c3IconBars。
+  //   否则 drawTopBar()/enterBoard()/tick 每调一次就推进一次滞回与 EMA,
+  //   加档速度翻倍、滞回形同虚设(S3 侧注释里踩过同一个坑)。
+  const int      bars = up ? ((c3IconBars >= 1) ? c3IconBars : 4) : 4;
+  const int16_t  radii[4] = { 2, 5, 8, 11 };            // 与 S3 同:间距 3,占 22x11
+  for (int i = 0; i < 4; ++i)
+    tft.drawArc(ICON_CX, ICON_CY, radii[i], radii[i] - 1, 135, 225,
+                (i < bars) ? col : bg, bg);
+}
+
+// 档位推进(1 Hz 调一次,见 tick)—— 与 S3 的 ⑥ 段一一对应
+static void wifiTierTick() {
+  if (WiFi.status() != WL_CONNECTED) {
     c3IconBars  = -1;
-    c3RssiEma10 = 0;                                     // 断开就丢平滑值
+    c3RssiEma10 = 0;                                    // 断开就丢平滑值
+    return;
   }
-  // 未连接:4 段全灰(保持"灰满格 = 无连接"的既有视觉);
-  // 已连接:只点亮前 bars 段,其余擦成顶栏底色 bg。
-  const int      bars  = up ? ((c3IconBars >= 1) ? c3IconBars : 4) : 4;
-  const int16_t  cx    = ICON_X + 8;
-  const int16_t  cy    = ICON_Y + ICON_H - 1;
-  const int16_t  radii[4] = { 1, 5, 9, 13 };
-  for (int i = 0; i < 4; ++i) {
-    const int16_t r = radii[i], ir = r - 1;             // 厚 1px
-    tft.drawArc(cx, cy, r, ir, 135, 225, (i < bars) ? color : bg, bg);
-  }
+  // ★ 先 EMA 平滑(α=1/5,1 Hz 下 τ≈5 s)再分档 ——
+  //   实测那付天线瞬时 RSSI 波动可达 7 dB,只靠滞回图标仍会闪。
+  const int rs = (int)WiFi.RSSI();
+  if (c3RssiEma10 == 0) c3RssiEma10 = rs * 10;
+  else                  c3RssiEma10 += (rs * 10 - c3RssiEma10) / 5;
+  const int sm = (c3RssiEma10 + 5) / 10;                // 四舍五入回 dBm
+  c3IconBars = c3WifiBarsHyst(sm, c3IconBars);
 }
 
 static void drawTopBar() {
@@ -1780,7 +1862,8 @@ static void drawStatusLine() {
     const IPAddress a = WiFi.localIP();
     snprintf(ip, sizeof(ip), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
   } else {
-    snprintf(ip, sizeof(ip), "--");
+    // ★ v1.2.13:`--` 太含糊(用户 2026-10-31 看到"IP 没显示"以为坏了,其实是没连上)
+    snprintf(ip, sizeof(ip), "NO-WIFI");
   }
   snprintf(b, sizeof(b), "LINK %s | %lu | %s",
            s3link::ok() ? "ok" : "--", (unsigned long)s3link::baud(), ip);
@@ -2231,8 +2314,8 @@ static void scDraw() {
 
   // ---- 顶栏(点它 = 退出) ----
   // ★ v0.9(用户 2026-10-14 报):这里**不能再画 WiFi 图标**。
-  //   图标占 x≈205~231,而面包屑 "WIFI / S3 / SCAN"(16 字符)右对齐到 x=234
-  //   ⇒ 两者重叠约 26px,把 "SCAN" 几个字压花。用户原话:"它跟要显示的那个菜单状态
+  //   图标占 x≈214~236,而面包屑 "WIFI / S3 / SCAN"(16 字符)右对齐到 x=234
+  //   ⇒ 两者重叠约 22px,把 "SCAN" 几个字压花。用户原话:"它跟要显示的那个菜单状态
   //   重叠了"。键盘页(MODE_KB)本来就没有这颗图标,所以那边不重叠 —— 现在扫描页也去掉,
   //   两类"有自己的顶栏"的页面就一致了。tick() 里也要把 MODE_SCAN 一起挡掉,否则每秒
   //   又会把它补画回来(见 tick() 那一行)。
@@ -3944,7 +4027,7 @@ static void drainLink() {
     //   背景:v0.8.7 把 S3 的**空回显**(`@s ok <原命令>`)降噪丢掉了,用户随即指出
     //   "我发命令过去、它收没收到我不知道" —— **"收到了"和"结果是啥"是两件事**,
     //   不能只留后者。现改为三类分流,全部用 `[S3]` 徽标开头(与 C3 本机行的 `[C3]` 对称):
-    //     · `wifi ok/fail/try …` = S3 的连接结果 -> `[S3] wifi ok 192.168.4.40`
+    //     · `wifi ok/fail/try …` = S3 的连接结果 -> `[S3] wifi ok 192.168.2.40`
     //     · `txt <文本>`         = S3 的**命令结果**(status/温湿度/PPS/台账…),
     //                              由 S3 侧 rptText() 发 -> `[S3] ST sat0/12 hdop7.8 cn0 25`
     //     · 其余(`s` / `t` / `wadd …`) = **收到回执** -> `[S3] OK s`(OK 大写)
@@ -4061,8 +4144,9 @@ static void tick() {
   if (millis() - lastTick < 1000) return;
   lastTick = millis();
   pushTick();                                   // ★ v0.7:一秒推一条给 S3(状态机)
+  wifiTierTick();                               // ★ 2026-10-31:每秒推进一次 WiFi 档位(带 EMA+滞回)
   // ★★ v0.9(用户 2026-10-14 报的缺陷):凡是"自己有顶栏"的页面都**不刷 WiFi 图标**。
-  //   这颗图标占 x≈205~231,而扫描页/名单页的面包屑右对齐到 x=234 ⇒ 两者重叠约 26px,
+  //   这颗图标占 x≈214~236,而扫描页/名单页的面包屑右对齐到 x=234 ⇒ 两者重叠约 22px,
   //   把面包屑尾巴压花。键盘页(MODE_KB)老早就挡了,扫描页是**漏网的那个** ——
   //   所以以前在扫描页上它会每秒被补画一次,盖都盖不住。
   //   ★ v1.2.1:补 MODE_EVT —— 搬运页顶栏右上角是 NEXT 按钮,图标每秒补画会压花它

@@ -90,12 +90,12 @@ Sudden jumps in the offset are easy to catch; **slow drift is hard**: a 0.05 m/s
 
 Use a cumulative sum: `S += (dev − k)`; raise an alarm when `S` crosses its threshold.
 - μ = slow baseline (τ ≈ 5.5 min), not the current value
-- The statistic has an 8 m absolute gate, preventing "the baseline drifting along"
+- The statistic has a 15 m absolute gate, preventing "the baseline drifting along"
 - **For the first 90 s, only μ is built; the statistic is locked at 0** — cold-start data is not trustworthy,
   and using it as the baseline makes the device "drift from the moment it powers on"
 
 > Measured conclusion (contrary to the original design intent): under ramps of 0.02–0.4 m/s,
-> **the 8 m absolute gate trips first and CUSUM confirms afterwards**. So the CUSUM here is a
+> **the gate trips first and CUSUM confirms afterwards**. So the CUSUM here is a
 > second gate, not an early warning. `tools/cusum_replay.py` reproduces this table offline.
 
 ### 4.3 Multipath identification

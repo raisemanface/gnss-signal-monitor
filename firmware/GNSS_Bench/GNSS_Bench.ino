@@ -352,9 +352,22 @@ constexpr int LED_RGB_PIN = 48;
 constexpr int LED_BRIGHT  = 60;      // 0~255,WS2812 全亮很刺眼,60 足够看清
 
 // ---------------- 串口 ----------------
-constexpr long GNSS_BAUD      = 9600;  // ATGM336H 出厂默认 9600 8N1
+constexpr long GNSS_BAUD      = 9600;  // ATGM336H 出厂常为 9600 8N1(首选,见下面 kViableBauds)
 constexpr int  NMEA_LINE_MAX  = 100;   // 单行最大字符数
 constexpr int  NMEA_POOL      = 24;    // 环形缓冲保留行数
+
+// ★ v1.14.11:**波特率自寻**。
+//   现场(2026-10-31)踩到的坑:板子断电放了一段时间再上电,模块配置掉回出厂
+//   **115200**,而固件一直按 9600 听 —— 收进来的全是采样错的乱码(byte 计数在涨、
+//   totalLines 恒 0、一颗星都没有),屏上一直 NO-DATA,看着像模块坏了 / 像固件改坏了。
+//   实测同一根线换 115200 立刻是完整 NMEA($GNGGA/$GNRMC/$GPTXT,ANTENNA OK)。
+//   结论:**模块的波特率是"会变的外部状态",不能写死在固件里**。
+//   做法:首选 9600;连续 3 s 一条有效报文都没有,就按序换下一个再听 2.5 s。
+//   收到报文即锁定,不再折腾。整轮 5 档 ≈ 15 s,开机多花十几秒,换来"永远不用管它"。
+constexpr uint32_t kViableBauds[] = {9600, 115200, 38400, 19200, 4800};
+constexpr uint8_t  kBaudCount     = sizeof(kViableBauds) / sizeof(kViableBauds[0]);
+constexpr uint32_t kNoLineHuntMs  = 3000;   // 多久没报文就开始换档
+constexpr uint32_t kBaudDwellMs   = 2500;   // 每档听多久
 
 // ---------------- 判据阈值(对齐参赛方案 6.2 双阈值 + 7.10 定点一致性)----------------
 constexpr int      TH_MIN_SATS_USED  = 4;      // 参与定位星数下限
@@ -389,6 +402,14 @@ constexpr float kSigRefM = 0.6f;    // C/N0 = 45 dB-Hz 时的单星测距噪声(
 constexpr float kCn0Ref  = 45.0f;   // 上面那个参考点(dB-Hz)
 constexpr float kSigMinM = 0.25f;   // 下限:再好的星也不许算出 0(否则 HPL=0 像"绝对准")
 constexpr float kSigMaxM = 40.0f;   // 上限:半边天被挡时防止 HPL 溢成天文数字
+//  ★ v1.14.12 σ 统计的"可用"下限。2026-10-31 阳台实测:GSV 里躺着 C/N0 = 6 dB-Hz
+//    的星(接收机根本不可能拿它定位),而"取最强 k 颗"的 k 用的是 GGA 的 satsUsed ——
+//    两者一凑,6 dB 的星就进了 σ 的均方根,一颗就把 σ 抬 8 m、HPL 抬一倍多
+//    (实测 HPL 在 6.4 ↔ 33.8 m 之间来回跳,还真触发过一次 22 s 的 HPL-HIGH,
+//    事件 #255)。25 dB-Hz 是"低于它接收机不可能用于定位"的常识线;
+//    低于它的星不参与 σ 统计 —— 这不是放松门限,是把**不参与解算的星**
+//    从"最坏情况"里请出去。
+constexpr float kCn0Usable = 25.0f; // σ 统计的 C/N0 下限(dB-Hz);低于它不算"参与了定位"
 
 // ---- ② 保护级:HPL = kHplK · HDOP · σ_UERE ----
 //  kHplK = 5.33 取自航空界的常用量级(单侧虚警 ~1e-7 / 漏检 ~1e-3 量级的多重覆盖因子),
@@ -417,8 +438,8 @@ constexpr float kHplK = 5.33f;
 // ---- ⑤ CUSUM(单侧、向上):抓"慢慢挪",阈值法抓不到的那一类 ----
 //  为什么需要它:真实的位置欺骗往往**不是瞬移**,而是一分钟拉偏几米。
 //  阈值法(off > 30 m)要等到 30 m 才响;CUSUM 累积"每拍超出正常起伏的那一点点",
-//  配合下面 8 m 的绝对闸,能在 8 m 量级就给出"这是持续趋势"的判据 —— 这段时间
-//  足够人去做处置。
+//  配合下面 15 m 的绝对闸,能在"明显超出常态"的量级上给出"这是持续趋势"的判据 ——
+//  这段时间足够人去做处置。(8 m 闸在小尺度多径点位会误报,见 kCusumMinM。) 
 //
 //  ★ 公式(教科书列表型 CUSUM):
 //        S ← max(0, S + (off_filt − μ) − k)
@@ -432,8 +453,13 @@ constexpr float kCusumAlpha = 0.05f;   // 一阶低通 α(1 Hz ⇒ τ ≈ 20 s):
 constexpr float kCusumMuA   = 0.003f;  // 慢基线 α(τ ≈ 5.5 min):"平时在哪儿"
 constexpr float kCusumSlack = 1.0f;    // 允许的正常起伏(m):偏差小于它就不累积
 constexpr float kCusumH     = 20.0f;   // 判决门限(m·s):约等于"多出 1 m 持续 20 s"
-constexpr float kCusumMinM  = 8.0f;    // ★ 绝对闸:偏离还没到 8 m 就不许判"漂移"
-                                       //   (基准本身差几米时,靠它把噪声挡在门外)
+constexpr float kCusumMinM  = 15.0f;   // ★ v1.14.10 绝对闸:8 -> 15 m
+                                       //   2026-10-31 阳台实测:小尺度多径(铁栏杆/钢架)让
+                                       //   单点解常年偏 5~11 m,8 m 闸把"固有偏差"当成"在漂",
+                                       //   DRIFT 频繁误报。15 m 仍远低于 POS LIM 30 m,
+                                       //   "持续多出 1 m 才累积"的趋势判据不变 —— 只把
+                                       //   "基准本身差几米"挡在门外。若现场常态 >15 m,
+                                       //   该重标基准,而不是继续抬闸(抬到 30 就等于废掉本判据)。
 //  ★ v1.9.0 补丁(实机上抓出来的):**开机预热期**。
 //    起因:烧完一上电,`off` 稳定在 3 m 不动,统计量却逐拍 +1.25 线性涨,
 //    2.8 -> 3.9 -> ... -> 13.0,眼看就要撞 20 —— 设备一动不动,却在"累积漂移量"。
@@ -448,6 +474,26 @@ constexpr float kCusumMinM  = 8.0f;    // ★ 绝对闸:偏离还没到 8 m 就�
 //    (现场本来也要等基准稳下来,这 90 s 不占用任何判据窗口。)
 constexpr uint32_t kCusumWarmMs = 90000;  // 预热 90 s:只建 μ,不判决
 constexpr float    kCusumWarmA  = 0.15f;  // 预热期 μ 的 α(1 Hz ⇒ τ ≈ 6.5 s)
+
+//  ★★ v1.14.12 "闸下回落 + 上限"补丁(2026-10-31 阳台实测,CUSUM 挂在 848 不下来):
+//    现象:off 稳在 6~7 m,状态 INTEG-OK,统计量却冲到 848 m·s(H 的 42 倍),
+//    屏上条子钉满、数字吓人,还在以 ~2 m·s/s 的速度慢慢回落 —— 用户问
+//    "漂到 848 为什么不报警、为什么收不回来"。
+//    复盘(离线复算,tools/cusum_step_sim):开机首解 off≈2 m,μ 锚在 2;
+//    几分钟后多径环境稳定,off 站上 6~7 m —— **静态偏差挪了 5 m**。μ 的 τ≈5.5 min,
+//    要花十几分钟才追上;这段时间里 CUSUM 把"挪基准"当"漂移"逐拍累积,
+//    峰值 ≈ (5 m)×333 s ≈ 1650 量级,实测 848 正是这个量级的中途值。
+//    它不报警是**对的**:慢判据还有第二道绝对闸(filt > 15 m),6~7 m 的静态偏差
+//    被闸拦住 —— 这正是 v1.14.10 抬闸想保的行为。错的是**统计量没被告知**:
+//    闸在下面拦着,累积却照涨,于是"数值 42×H、状态 OK"这种自相矛盾的显示,
+//    而且真漂移来时统计量早已没有动态范围。
+//    治法(两条,都只动"统计量",不动判据结构):
+//    ① 闸下回落:filt ≤ 绝对闸时,这段时间按定义"不算漂",证据不该继续攥着 ——
+//       统计量按 kCusumSDecay 速率回落。848 → 0 约 7 min(实测它自己花 15 min)。
+//    ② 上限:kCusumSMax = 3×H。过 H 本来就是二值判决,40×H 与 3×H 信息量相同,
+//       封顶保住"还能看见回落"的动态范围。
+constexpr float    kCusumSMax   = 3.0f * kCusumH;  // 统计量上限(m·s):判决是二值的,封顶保动态范围
+constexpr float    kCusumSDecay = 2.0f;            // 闸下回落速率(m·s/s):848 → 0 约 7 min
 
 // ---- ⑥ 多径:CN0–仰角模板残差 ----
 //  正常天空里 CN0 随仰角**单调上升**(穿过的大气少、路径损耗小)。低仰角星却
@@ -685,7 +731,7 @@ constexpr int BACK_X = SCR_W - 6 - BACK_W;   // 170(右对齐,右边距 6)
 
 // ---- WiFi 信息卡(★ v1.7.2 新增)---------------------------------------------
 // 为什么要有它:S3 自己的 IP **屏上一直没有落脚点** —— 它只作为回执发给 C3
-//   (`@s ok ip 192.168.4.40`),想在地面看一眼得凑到 C3 的输出卡上。
+//   (`@s ok ip 192.168.2.40`),想在地面看一眼得凑到 C3 的输出卡上。
 //   而主界面三段式已经排满:四角块只有 92px 宽、数据条右侧只剩 56px 领地,
 //   11 字符的 IP(66px)塞不进任何一个固定位置。
 //   ⇒ 做成**按需弹卡**:点右上角那颗 WiFi 图标 -> 弹 4 秒 -> 自动收。
@@ -790,6 +836,11 @@ static int            headIdx    = 0;
 static int            stored     = 0;
 static uint32_t       totalLines = 0;
 static uint32_t       byteCount  = 0;
+// ★ v1.14.11:波特率自寻的运行状态(说明见 kViableBauds 那一段)
+static uint32_t       curBaud    = (uint32_t)GNSS_BAUD;   // 当前实际在听的波特率
+static uint8_t        baudIdx    = 0;                     // 在 kViableBauds 里的位置
+static uint32_t       lastLineMs = 0;                     // 最近一条 '$' 报文的时刻
+static uint32_t       lastHuntMs = 0;                     // 上次换档的时刻
 
 // ★ v1.7.0(用户 2026-10-16 20:47 拍板):**模拟信源整段删除**。
 //   这里原来有个 `recvEnabled` 开关 —— 模拟信源(1/2/3 档)接管时置 false,
@@ -802,7 +853,25 @@ static uint32_t       byteCount  = 0;
 //   当年靠 recvEnabled 解决;现在靠"删掉模拟段"从根上不再有这个问题。
 
 inline void begin() {
-  port.begin(GNSS_BAUD, SERIAL_8N1, PIN_GNSS_RX, PIN_GNSS_TX);
+  curBaud    = (uint32_t)GNSS_BAUD;
+  baudIdx    = 0;
+  lastLineMs = millis();
+  lastHuntMs = millis();
+  port.begin(curBaud, SERIAL_8N1, PIN_GNSS_RX, PIN_GNSS_TX);
+}
+
+// ★ v1.14.11:一条有效报文都没来 ⇒ 换下一个波特率再听。
+//   只在"确实没报文"时动,收到报文后 3 s 内绝不折腾 —— 正常运行时这条函数什么都不做。
+inline void baudHunt(uint32_t now) {
+  if (totalLines > 0 && (now - lastLineMs) < kNoLineHuntMs) return;
+  if (now - lastHuntMs < kBaudDwellMs) return;
+  lastHuntMs = now;
+  baudIdx = (uint8_t)((baudIdx + 1) % kBaudCount);
+  curBaud = kViableBauds[baudIdx];
+  port.updateBaudRate(curBaud);
+  lineLen = 0;                                   // 换档后旧半行作废,免得拼出新垃圾
+  Serial.printf("[gnss] %.1fs 无有效报文 -> 换 %lu 8N1 再听\n",
+                (double)kNoLineHuntMs / 1000.0, (unsigned long)curBaud);
 }
 
 inline void poll() {
@@ -826,6 +895,7 @@ inline void poll() {
           headIdx = (headIdx + 1) % NMEA_POOL;
           if (stored < NMEA_POOL) stored++;
           totalLines++;
+          lastLineMs = millis();       // ★ v1.14.11:收到报文 —— 波特率对了,别再换档
         }
         lineLen = 0;
       }
@@ -835,6 +905,75 @@ inline void poll() {
       lineLen = 0;                 // 超长行丢弃,重新对齐
     }
   }
+}
+
+// ★ v1.14.11:原始字节诊断。
+//   现场"一个 NMEA 都不进来"时,只看 totalLines / cksumErr 分不清两种死因:
+//     ① 模块压根没吐(UART 线上 0 字节)      -> 查供电/接线/模块
+//     ② 有字节但收不对(波特率错、线上被拉死) -> 查波特率/信号完整性
+//   rawBytes() 给出"不管内容、只数个数"的累计值;s 行里直接带出来。
+inline uint32_t rawBytes() { return byteCount; }
+
+// 'y' 命令用:把接下来 ms 毫秒里收到的原始字节吐到串口。
+// 注意:这里**绕开**上面 poll() 的组帧状态机(只为看清线上到底是什么),
+// 读走的字节不进 totalLines,探针结束后 lineBuf 里可能残留半行,
+// 下一拍 poll() 会自然把它顶掉 —— 纯诊断用,不影响正常运行。
+//
+// ★ v1.14.11 追加三样:
+//   ② baud 参数:临时把 UART1 换成别的波特率收(收完自动换回),用来判"模块是不是换了波特率";
+//   ③ ASCII 直显:能直接看出是不是 "$GNRMC,..." 这种正常报文;
+//   ④ 字节间隔(gap)统计:真 UART 帧在同一句里字节间隔≈1.04ms(9600)且整齐,
+//      噪声/串扰的间隔是乱的 —— 这一条能把"线上有信号但被干扰"和"纯噪声"分开。
+inline void rawProbe(uint32_t ms, uint32_t baud) {
+  const char* hex = "0123456789ABCDEF";
+  char row[3 * 16 + 8];
+  int  col = 0, acol = 0;
+  char ascii[76];
+  uint32_t n = 0, t0 = millis(), prev = 0;
+  uint32_t gMin = 0xFFFFFFFF, gMax = 0, gSum = 0, gCnt = 0;
+
+  if (baud != GNSS_BAUD) port.updateBaudRate(baud);
+  Serial.printf("[bench] probe: %lums @%lu 8N1 (当前在听 %lu) | 已累计 byte %lu\n",
+                (unsigned long)ms, (unsigned long)baud, (unsigned long)curBaud,
+                (unsigned long)byteCount);
+
+  while (millis() - t0 < ms) {
+    if (!port.available()) { delay(1); continue; }
+    int c = port.read();
+    if (c < 0) continue;
+    uint32_t now = micros();
+    if (n > 0 && (now - prev) < 200000UL) {          // 超过 200ms 的算"断句",不计入
+      uint32_t g = now - prev;
+      if (g < gMin) gMin = g;
+      if (g > gMax) gMax = g;
+      gSum += g; gCnt++;
+    }
+    prev = now; n++;
+
+    if (n <= 96) {                                    // 前 96 字节给 hex
+      row[col++] = hex[(c >> 4) & 0x0F];
+      row[col++] = hex[c & 0x0F];
+      row[col++] = ' ';
+      if (col >= 48) { row[col] = 0; Serial.println(row); col = 0; }
+    }
+    ascii[acol++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+    if (acol >= 72) { ascii[acol] = 0; Serial.print("  |"); Serial.println(ascii); acol = 0; }
+  }
+  if (col) { row[col] = 0; Serial.println(row); }
+  if (acol) { ascii[acol] = 0; Serial.print("  |"); Serial.println(ascii); }
+
+  Serial.printf("[bench] probe done: %lu bytes / %lums",
+                (unsigned long)n, (unsigned long)ms);
+  if (n == 0) {
+    Serial.println("  <-- 线上一个字节都没有(模块没吐 / 线断 / 没供电)");
+  } else if (gCnt >= 8) {
+    Serial.printf(" | gap min %lu max %lu avg %lu us  <-- 9600 正常应≈1042us 且整齐\n",
+                  (unsigned long)gMin, (unsigned long)gMax, (unsigned long)(gSum / gCnt));
+  } else {
+    Serial.println(" | gap 样本不足");
+  }
+
+  if (baud != curBaud) port.updateBaudRate(curBaud);   // ★ 换回"当前在听"的档,不是硬编码 9600
 }
 
 // back = 0 取最新一行;取不到返回 nullptr
@@ -1724,9 +1863,10 @@ inline void clearBase() {
 //  (用户 2026-10-17 拍板:"P1+P2 一起做")
 // ----------------------------------------------------------------------------
 //  **为什么必须加**(2026-10-17 现场实证,不是猜测):
-//    NVS 里那份基准与文档记录的同一台架坐标相差 203.6 m,且**几乎纯纬向**(203.7 m)。
-//    当时现场抓到的却是 `sat 8/20 | hdop 1.9 | cn0 31`(好定位)却恒报 POS-ANOMALY off=248m。
-//    按 248 m 反推当前点,与文档那份只差 39 m(正常噪声)
+//    NVS 里那份基准是 (30.69018,103.89323),而 10-16 文档记录的同一台架坐标是
+//    (30.68835,103.89316) —— 相距 203.6 m,且**几乎纯纬向**(203.7 m)。当时现场
+//    抓到的却是 `sat 8/20 | hdop 1.9 | cn0 31`(好定位)却恒报 POS-ANOMALY off=248m。
+//    按 248 m 反推当前点 ≈ 30.68800,与 10-16 那份只差 39 m(正常噪声)
 //    ⇒ 收进来的坐标是对的,**错的是尺子**:存基准那一刻的定位是坏的。
 //  根因:老 saveBase() 的准入只有 `fixValid` —— **"有定位"不等于"定位准"**。
 //    冷启动首解、半边天遮挡、窗边/墙边多径,都能给出 fixValid=true 而偏几百米的
@@ -2095,6 +2235,7 @@ struct State {
   float sigma  = 0;       // σ_UERE 代表值(米)
   int   nSig   = 0;       // 参与 σ 统计的星数
   float cusum  = 0;       // 单侧(向上)CUSUM 统计量(m·s)
+  bool  gated  = false;   // ★ v1.14.12:统计量正被绝对闸拦着(off 滤波 ≤ 15 m)
   bool  slow   = false;   // 已判定"在慢慢漂"
   int   mpN    = 0;       // 多径可疑星数
   float mpMax  = 0;       // 最大正残差(dB)
@@ -2130,6 +2271,14 @@ static float sigmaUere(int* nOut) {
 
   int k = nmea::st.satsUsed;               // 参与定位的星数
   if (k <= 0 || k > have) k = have;
+  // ★ v1.14.12:升序数组里"低于可用下限"的星集中在**头部**,先数出可用尾长。
+  //   不设这条线时,GSV 里的 6~23 dB 弱星会随着"最强 k 颗"的 k 浮动进进出出,
+  //   一颗 6 dB 的星(σ 上限 40 m)就能把 HPL 抬一倍 —— 见 kCn0Usable 的注释。
+  int usable = have;
+  while (usable > 0 && nmea::st.cn0[have - usable] < kCn0Usable) --usable;
+  if (usable >= 4) {                       // 少于 4 颗就不该有解 —— 退回老算法,宁大勿小
+    if (k > usable) k = usable;
+  }
   double sum = 0.0;
   for (int i = have - k; i < have; ++i) {  // 升序数组的末尾 = 最强的 k 颗
     const float s = sigmaOf(nmea::st.cn0[i]);
@@ -2189,7 +2338,7 @@ static uint32_t sWarmSince = 0;    // 预热期起点,见 kCusumWarmMs
 
 void resetBaseline() {
   sFiltInit = false; sOffFilt = 0; sMu = 0; sWarmSince = 0;
-  g.cusum = 0; g.slow = false;
+  g.cusum = 0; g.gated = false; g.slow = false;
 }
 
 void tick(float off) {
@@ -2234,32 +2383,44 @@ void tick(float off) {
   if (judge::baseSet && nmea::st.fixValid) {
     if (!sFiltInit) {
       sOffFilt = off;
-      // ★ v1.13.1 重启失忆补丁(2026-10-24 阳台实测):开机时 off 已过绝对闸(≥8m)的话,
+      // ★ v1.13.1 重启失忆补丁(2026-10-24 阳台实测):开机时 off 已过绝对闸的话,
       //   μ 锚在基准(0),不能再跟着 off 走 —— 否则 μ 先站上 11m、dev 恒 0,
       //   检测器对"开机即偏"永久失明(实证:15:42 重启后 off 11.7m 全程 INTEG-OK,
       //   事件 #204/#205;回放 tools/重启失忆-回放对比.py 三情景全绿)。
-      //   off < 8m 时 μ=off,与 v1.13.0 完全一致 —— v1.9.0 的"3m 假漂"预热治法不变。
+      //   off < 闸值时 μ=off,与 v1.13.0 完全一致 —— v1.9.0 的"3m 假漂"预热治法不变。
+      //   ★ v1.14.10:闸 8→15 m,盲区随之上移 —— 开机即偏 <15 m 不再触发判据,
+      //     这是为"小尺度多径常态偏差 5~11 m"付的代价,现场需知情。
       sMu = (off < kCusumMinM) ? off : 0.0f;
       sFiltInit = true;
-      sWarmSince = now; g.cusum = 0; g.slow = false;
+      sWarmSince = now; g.cusum = 0; g.gated = false; g.slow = false;
     }
     sOffFilt += kCusumAlpha * (off - sOffFilt);
     const float dev = sOffFilt - sMu;
     if ((now - sWarmSince) < kCusumWarmMs) {
       // 预热期:μ 快追,统计量锁 0(理由见 kCusumWarmMs 的注释)
-      // ★ v1.13.1:快追加同一道闸 —— off 已过 8m 时不吸收,否则预热 90s 就把
+      // ★ v1.13.1:快追加同一道闸 —— off 已过闸值时不吸收,否则预热 90s 就把
       //   大偏移吃进基线,补丁①白做。两道闸合起来:预热结束即由 CUSUM 如实点亮。
       if (sOffFilt < kCusumMinM) sMu += kCusumWarmA * dev;
       g.cusum = 0;
+      g.gated = (sOffFilt <= kCusumMinM);   // ★ v1.14.12:预热期也如实报告闸状态
       g.slow  = false;
     } else {
       sMu += kCusumMuA * dev;
-      g.cusum = fmaxf(0.0f, g.cusum + dev - kCusumSlack);
-      g.slow  = (g.cusum > kCusumH) && (sOffFilt > kCusumMinM);
+      // ★ v1.14.12:统计量与绝对闸**同侧** —— 闸拦住判决,也拦住累积(理由见上面
+      //   "闸下回落 + 上限"段)。过闸后封顶在 3×H,保证屏上永远看得到"涨/落"。
+      if (sOffFilt <= kCusumMinM) {
+        g.cusum = fmaxf(0.0f, g.cusum - kCusumSDecay);
+        g.gated = true;
+        g.slow  = false;
+      } else {
+        g.cusum = fminf(kCusumSMax, fmaxf(0.0f, g.cusum + dev - kCusumSlack));
+        g.gated = false;
+        g.slow  = (g.cusum > kCusumH);
+      }
     }
   } else {
     sFiltInit = false; sOffFilt = 0; sMu = 0; sWarmSince = 0;
-    g.cusum = 0; g.slow = false;
+    g.cusum = 0; g.gated = false; g.slow = false;
   }
 
   // ---- ④ 多径:先更新模板,再算残差 ----
@@ -3637,7 +3798,7 @@ inline void paintSky();
 
 // ---------------- WiFi 信息卡(★ v1.7.2:给 S3 自己的 IP 一个落脚点) ----------------
 // 背景:用户 2026-10-16 深夜问"S3 的 IP 地址显示在哪里?" —— 答案是**屏上一直没有**,
-//   它只作为回执发给 C3(`@s ok ip 192.168.4.40`),要看只能凑到 C3 的输出卡上。
+//   它只作为回执发给 C3(`@s ok ip 192.168.2.40`),要看只能凑到 C3 的输出卡上。
 //   而主界面三段式已排满:四角块只有 92px 宽、数据条右侧只剩 56px 领地,
 //   11 字符的 IP(66px)塞不进任何固定位置 ⇒ 改成**按需弹卡**(几何见 CARD_* 常量)。
 // 触发:点**右上角那颗 WiFi 图标** —— 整个右上四角块(92x24)都是热点,好按不误触。
@@ -4407,17 +4568,46 @@ inline void drawInteg() {
   spr->setTextDatum(TL_DATUM);
 
   // 横条量程 0..2*AL ⇒ AL 正好落在正中,"离警戒线还有多远"一眼可读。
+  // ★★ v1.14.12 三处可读性改造(用户 2026-10-31:"值到了什么程度条是什么颜色看不出来"):
+  //   ① 分区底色:0..AL 暗绿(可信区) / AL..2AL 暗紫(超限区) —— 不用读刻度也知道
+  //      条子越没越线;
+  //   ② 填充色**按比值分级**:hpl < 0.5·AL 绿(离警戒远)/ 0.5~1·AL 琥珀(在逼近,
+  //      老版这里和 5 m 时一个颜色,毫无预警)/ > 1·AL 紫(已越限)。hplBad 迟滞
+  //      依旧独立生效 —— 条色是"严重程度",报警是"过迟滞的判决",两码事;
+  //   ③ 峰值残留:一条 2px 灰细线记最近峰值(0.02 m/s 慢慢滑落),HPL 是抖的,
+  //      眼睛跟不上,峰值线替你记住"刚才最高到过哪儿"。
+  const int   alX  = x0 + w / 2;
+  const float alM  = tune::alertM();
   spr->fillRect(x0, by, w, bh, CLR_RULE);
+  spr->fillRect(x0, by, w / 2, bh, 0x11C4);          // 暗绿 #123820
+  spr->fillRect(alX, by, w - w / 2, bh, 0x292A);     // 暗紫 #2A2450
+  static float sHplPeak = 0.0f;                      // 峰值残留(1 Hz 刷新,衰减 0.02 m/s)
   if (integ::valid()) {
-    int fw = (int)(integ::hpl() / (2.0f * tune::alertM()) * (float)w);
+    const float hv = integ::hpl();
+    sHplPeak = fmaxf(hv, sHplPeak - 0.02f);
+    const int pkX = x0 + (int)fminf(1.0f, fmaxf(0.0f, sHplPeak / (2.0f * alM))) * w;
+    spr->drawFastVLine(pkX, by - 2, bh + 4, CLR_INK2);
+    int fw = (int)(hv / (2.0f * alM) * (float)w);
     if (fw > w) fw = w;
     if (fw < 1) fw = 1;
-    spr->fillRect(x0, by, fw, bh, integ::hplBadOn() ? C_ST_HPL : C_ST_OK);
+    const float rr  = hv / alM;
+    const uint16_t fc = integ::hplBadOn() ? C_ST_HPL
+                      : (rr > 1.0f)     ? C_ST_HPL
+                      : (rr >= 0.5f)    ? C_ST_DRIFT
+                                        : C_ST_OK;
+    spr->fillRect(x0, by, fw, bh, fc);
+  } else {
+    sHplPeak = 0.0f;
   }
-  spr->drawFastVLine(x0 + w / 2, by - 2, bh + 4, C_WARN);       // AL 刻线
+  spr->drawFastVLine(alX, by - 2, bh + 4, C_WARN);   // AL 刻线(压在分区底色上)
 
-  if (integ::valid()) snprintf(b, sizeof(b), "HPL %4.1fm  VPL %4.1fm", integ::hpl(), integ::g.vpl);
-  else                snprintf(b, sizeof(b), "HPL  ---   VPL  ---");
+  if (integ::valid()) {
+    // ★ v1.14.12:补一个 %AL —— "8.2 m" 是多少危险,除一下 AL 才有共同语言
+    snprintf(b, sizeof(b), "HPL %4.1fm %2.0f%%AL  VPL %4.1fm",
+             integ::hpl(), integ::hpl() / alM * 100.0f, integ::g.vpl);
+  } else {
+    snprintf(b, sizeof(b), "HPL  ---        VPL  ---");
+  }
   spr->setTextColor(integ::hplBadOn() ? C_ST_HPL : CLR_INK, C_BLOCK);
   spr->drawString(b, x0, INT_Y + 28);
 
@@ -4472,20 +4662,38 @@ inline void drawDetect() {
   spr->setTextColor(CLR_INK2, C_BLOCK);
   spr->drawString("DETECTORS", x0, DET_Y + 5);
   spr->setTextDatum(TR_DATUM);
-  spr->setTextColor(integ::slowOn() ? C_ST_DRIFT : C_ST_OK, C_BLOCK);
-  spr->drawString(integ::slowOn() ? "SLOW-DRIFT" : "OK", CARD_X + CARD_W - pad, DET_Y + 5);
+  // ★ v1.14.12:右上角状态词从两态改三态 —— 原来 CUSUM 挂在 848 时这里写 "OK",
+  //   数字 42 倍超限、状态却 OK,自相矛盾。GATED = 绝对闸(off 滤波 ≤ 15 m)正拦着,
+  //   "数字在涨/落都不构成判决"这件事本身要让看屏的人知道。
+  {
+    const char*  word = "OK";
+    uint16_t     wc   = C_ST_OK;
+    if (integ::slowOn())      { word = "SLOW-DRIFT"; wc = C_ST_DRIFT; }
+    else if (integ::g.gated)  { word = "GATED";      wc = CLR_INK2;   }
+    spr->setTextColor(wc, C_BLOCK);
+    spr->drawString(word, CARD_X + CARD_W - pad, DET_Y + 5);
+  }
   spr->setTextDatum(TL_DATUM);
 
-  // CUSUM 条:0..H 线性;过 H(条子满)就是"开始漂了"
+  // CUSUM 条:★ v1.14.12 量程 0..3H(原来 0..H,过限就钉死在满条,看不出回落)。
+  //   H 刻线在 1/3 处;过 H 未判(理论上不该发生,判据与统计量已同侧)琥珀,
+  //   判为慢漂移红色,平时数据青。
   spr->setTextColor(CLR_INK, C_BLOCK);
-  snprintf(b, sizeof(b), "CUSUM %4.1f / %.1f", integ::g.cusum, kCusumH);
+  snprintf(b, sizeof(b), "CUSUM %5.1f / %.0f", integ::g.cusum, kCusumH);
   spr->drawString(b, x0, DET_Y + 18);
 
   const int by = DET_Y + 29, bh = 5;
+  const int hX = x0 + w / 3;                         // H(判决门限)落点
   spr->fillRect(x0, by, w, bh, CLR_RULE);
-  int fw = (int)(integ::g.cusum / kCusumH * (float)w);
+  spr->fillRect(x0, by, w / 3, bh, 0x11C4);          // 0..H 暗绿:统计量"属于判决区"
+  int fw = (int)(integ::g.cusum / (3.0f * kCusumH) * (float)w);
   if (fw > w) fw = w;
-  if (fw > 0) spr->fillRect(x0, by, fw, bh, integ::slowOn() ? C_ST_POS : C_DATA);
+  if (fw > 0) {
+    const uint16_t fc = integ::slowOn() ? C_ST_POS
+                      : (integ::g.cusum > kCusumH) ? C_ST_DRIFT : C_DATA;
+    spr->fillRect(x0, by, fw, bh, fc);
+  }
+  spr->drawFastVLine(hX, by - 2, bh + 4, C_WARN);    // H 刻线
 
   // 多径:只报"低仰角却比模板明显更强"的那几颗。
   // 没有可疑星时**显式写 thr**,否则屏上只有一句 "MP none",看的人不知道
@@ -6555,6 +6763,22 @@ static int      trN    = 0;        // 本次要试到第几条(1 起算)
 static int      trIdx  = 0;        // 当前正试第几条
 static volatile uint8_t evFast = 0; // 事件回调置的"快失败"reason(201/202),poll() 里消费
 
+// ★ v1.14.13:开机巡台账全失败后的**后台自动重试**(用户 2026-11-01:"每次启动都不能自动连 WiFi,一定要修复")
+//   现场实测:开机第一把 reason=6 NOT_AUTHED -> 203 ASSOC_FAIL -> 10s 超时趴死,
+//   而几十秒后人工 `w try` 一把就成 —— 台账/密码没问题,是首连时序差口气,
+//   旧版 "ALL FAILED -> stay offline" 从此不动,只能人工救。改成:
+//     · 失败后 30s 重试一轮,连败 3 轮后放宽到每 5 分钟一轮,连上或台账清空才停;
+//     · 每轮失败仍走 connFailed -> radioOff():射频内存照样还堆(charts sprite 不受影响,
+//       与 v1.5.16 的取舍一致);正在动图页时自动推迟,不在全屏 sprite 在场时起射频;
+//     · 自动轮给 C3 的进度/失败回执静音(arQuiet),串口日志照打 —— 免得每 5 分钟刷 C3 的屏;
+//     · 任何人工 `w ...` 命令立即取消未到点的自动轮(arQuiet 也复位)。
+static uint32_t retryAt = 0;      // 0=没排定;否则=下一轮 tryAll 的到点 millis()
+static uint16_t retryN  = 0;      // 已跑过的自动重试轮数(决定快/慢间隔)
+static bool     arQuiet = false; // true = 本轮是自动重试,C3 回执静音
+constexpr uint32_t kRetryFastMs     = 30000;    // 前 3 轮:失败后 30 s 再试
+constexpr uint32_t kRetrySlowMs     = 300000;   // 连败 3 轮后:每 5 min 一轮
+constexpr uint32_t kRetryPostponeMs = 60000;    // 撞上 charts 页:推迟 1 min 再排
+
 static void load() {
   prefs.begin(kNvsName, false);
   cnt = (int)prefs.getUInt("cnt", 0);
@@ -6877,22 +7101,30 @@ static void connFailed(const char* why) {
     ++trIdx;
     char b[56];
     snprintf(b, sizeof(b), "wifi try %d/%d %.16s", trIdx, trN, list[trIdx - 1].ssid);
-    queueRpt(b);
+    if (!arQuiet) queueRpt(b);                     // ★ v1.14.13:自动重试轮静音(下同)
     connIdx(trIdx);
     return;
   }
   if (trOn) {                                      // 台账全试完,一个都没成
     trOn = false;
-    queueRpt("wifi fail all");
+    if (!arQuiet) queueRpt("wifi fail all");       // ★ v1.14.13:自动重试轮静音
     Serial.println("[wifi] try: ALL FAILED -> stay offline");
+    // ★ v1.14.13:不趴死了 —— 排定后台自动重试(间隔随连败轮数放宽,连上为止)
+    retryAt = millis() + (retryN < 3 ? kRetryFastMs : kRetrySlowMs);
+    arQuiet = false;                               // 本轮到此结束,后续回执恢复正常
+    Serial.printf("[wifi] auto-retry scheduled: round %u in %us\n",
+                  (unsigned)(retryN + 1),
+                  (unsigned)((retryN < 3 ? kRetryFastMs : kRetrySlowMs) / 1000));
   } else {
     // ★ v1.5.21:分两行 —— 第一行"谁失败了",第二行"为什么"。
     //   挤一行放不下(SSID 长了会把原因顶掉),而"为什么"正是用户最要看的那条。
     char b[56];
-    snprintf(b, sizeof(b), "wifi fail %.18s", csSsid);
-    queueRpt(b);
-    snprintf(b, sizeof(b), "fail %s", failTag(why));
-    rptText(b);
+    if (!arQuiet) {                                // ★ v1.14.13:自动重试轮静音(下同)
+      snprintf(b, sizeof(b), "wifi fail %.18s", csSsid);
+      queueRpt(b);
+      snprintf(b, sizeof(b), "fail %s", failTag(why));
+      rptText(b);
+    }
   }
   WiFi.disconnect();
   radioOff();
@@ -6909,7 +7141,7 @@ static void tryAll(int n) {
   trOn = true; trN = n; trIdx = 1;
   char b[56];
   snprintf(b, sizeof(b), "wifi try %d/%d %s", trIdx, trN, list[0].ssid);
-  queueRpt(b);
+  if (!arQuiet) queueRpt(b);                        // ★ v1.14.13:自动重试轮静音
   Serial.printf("[wifi] try: %d entr%s, start with #1 \"%s\"\n",
                 trN, trN == 1 ? "y" : "ies", list[0].ssid);
   connIdx(1);
@@ -7074,8 +7306,26 @@ static int pickBestStored() {
   return best;
 }
 
-// 主循环每圈调一次:① "连上才存"状态机 ② 收割异步扫描结果
+// 主循环每圈调一次:⓪ 后台自动重试 ① "连上才存"状态机 ② 收割异步扫描结果
 static void poll() {
+  // ---- ⓪ ★ v1.14.13:后台自动重试消费(排最前,抢在状态机之前) ----
+  //   到点了就按台账顺序重试一轮;走的就是人工 `w try` 那条路(radioOff 后
+  //   mode(WIFI_STA) 会走完整 init 路径重新初始化,见 ③ scan 段的长注)。
+  if (!csBusy && retryAt && (int32_t)(millis() - retryAt) >= 0) {
+    retryAt = 0;
+    if (cnt > 0 && WiFi.status() != WL_CONNECTED) {
+      if (ui::page == ui::PAGE_CHARTS) {          // 全屏 sprite 正被动图页拿着
+        retryAt = millis() + kRetryPostponeMs;    //   -> 推迟 1 min,别抢那 153 KB
+        Serial.println("[wifi] auto-retry: charts page in front -> postpone 60s");
+      } else {
+        ++retryN;
+        arQuiet = true;                           // 本轮给 C3 的回执静音
+        Serial.printf("[wifi] auto-retry: round %u\n", (unsigned)retryN);
+        tryAll(cnt);
+      }
+    }
+  }
+
   // ---- ① 连接状态机:"拿到 IP 才算成功,才存" ----
   if (csBusy) {
     if (evFast) {                                  // ★ v1.5.19:事件回调报的 201/202,别干等 10s
@@ -7085,6 +7335,7 @@ static void poll() {
       connFailed(w);
     } else if (WiFi.status() == WL_CONNECTED) {
       csBusy = false; cur = 0; trOn = false;       // ★ v1.5.19:巡台账到此结束
+      retryAt = 0; retryN = 0; arQuiet = false;    // ★ v1.14.13:连上了,自动重试整个撤掉
       insertFront(csSsid, csPass);
       saveAll();
       // ★ v1.5.21:同 startConnect —— 回执带 SSID,分两行(见那一处的长注)
@@ -7176,6 +7427,7 @@ static bool scanNextLine(char* out, size_t cap) {
 
 // 解析 'w' 之后的子命令串(args 已不含 'w' 本身,如 "add myssid pass123")。
 static void cmd(const char* args) {
+  retryAt = 0; arQuiet = false;   // ★ v1.14.13:人在操作,未到点的自动轮撤掉,回执恢复正常
   while (*args == ' ') args++;
   char op[8] = "", a1[40] = "", a2[72] = "";
   int  nscan = sscanf(args, "%7s %39s %71[^\n]", op, a1, a2);
@@ -7441,7 +7693,7 @@ constexpr const char* kSub2  = "STUDIO";              // 与 MANFACE 同行同�
 //      ③ 发送绝不阻塞主循环(失败只计数丢弃,不重试不 delay);④ WiFi 未连时全静默。
 //      包格式 W1,OBS/EVT/HB/SKY/STA —— OBS 与 `o dump` 逐列同构,回放脚本不用改。
 //      ⚠ 北斗不进 SKY 包:本模块 GSV 不报 el/az,是数据事实不是漏发。
-constexpr const char* kVer   = "v1.14.7";
+constexpr const char* kVer   = "v1.14.13";  // ★ v1.14.13:WiFi 台账巡连失败后的后台自动重试(30s x3 -> 5min 一轮)
 
 constexpr uint32_t kExpandMs = 5000;   // 展开时间下限(双进度取慢的"慢"边;2.5s→5s 用户定)
 constexpr uint32_t kHoldMs   = 2000;   // 展开满后的定格时长(0.8s→2s 用户定)
@@ -7871,9 +8123,9 @@ inline void poll() {
 
 static void printHelp() {
 #if ENABLE_INJ
-  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  k=inject tap/hold/swipe  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  y=raw bytes probe(hex)  sleep/wake/bl=screen debug  ?=help");
 #else
-  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  sleep/wake/bl=screen debug  ?=help");
+  Serial.println("[bench] commands: b=set base (again during 10s sampling = cancel)  c=clear base  s=status  p=params  t=temp/RH  g=pps  d=charts page  w=wifi add/seed/try/list/del/conn/scan/push  e=evt dump CSV  o=obs on/off/dump/clear/stat  x=clear evt pool  q=quiet toggle  u=utc/rtc  r=reset touch cal  v=event log page  y=raw bytes probe(hex)  sleep/wake/bl=screen debug  ?=help");
 #endif
   // v1.5.17:`wadd` 语义变了 —— 现在是"**连上才存**"(不是存了再连);
   //         另加 `wseed <ssid> <pass>` = 只写台账不连(C3 的 PUSH 走这条)。
@@ -7942,7 +8194,8 @@ static bool     gQuiet      = false;
 //    W1,EVT,<seq>,<e dump 的整行>                        ← 事件落笔瞬间发
 //    W1,HB ,<seq>,<uptime_s>,<heap_free>,<obs_tx>,<evt_tx>
 //    W1,SKY,<seq>,<G|B|E|R><svid>,<az>,<el>,<cn0>;...
-//    W1,STA,<seq>,<qual>,<satsView>,<satsUsed>,<hdop>,<tsrc>
+//    W1,STA,<seq>,<qual>,<satsView>,<satsUsed>,<hdop>,<tsrc>,<cusum 0.1m·s>,<slow 0|1>,<gated 0|1>
+//                                                          ★ v1.14.9 尾插两列 / ★ v1.14.12 尾插 gated
 //
 //  ⚠ 北斗**不会出现在 SKY 包里** —— 本模块 GSV 不报 el/az(nmea::SatFix 注释:
 //    实机 59/59 颗 el<0),talkers[] 里根本没有那些星。这是数据事实,不是漏发;
@@ -8134,11 +8387,19 @@ inline void obs(const char* line) {          // 与串口 obs 同一拍、同一
 
 inline void sta() {                          // 与 OBS 同拍(任务单 §1.2)
   if (!on) return;
+  //  ★ v1.14.9:尾插两列(一律加在最后 —— 插中间会让已存的解析端列位错掉):
+  //    cusum = CUSUM 统计量(m·s,位置域,见 integ 段 ⑤ 长注;屏上 DETECTORS 条同源);
+  //    slow  = 1 = 已判"慢漂移"(cusum 过 H 且过绝对闸；v1.14.10 起闸=15 m)。页面据此染红。
+  //    预热期(上电 90 s) cusum 锁 0 属正常 —— 只建基线不判决,见 kCusumWarmMs。
+  //  ★ v1.14.12:再尾插一列 gated(0|1)= 统计量正被绝对闸拦着(off 滤波 ≤ 15 m)。
+  //    没有"gated"时,看板看到 cusum 很大而 slow=0 会以为是故障 —— 其实是闸在
+  //    如实工作。解析端旧版本少读这一列不受影响(尾插向后兼容)。
   char b[128];
-  snprintf(b, sizeof(b), "W1,STA,%lu,%d,%d,%d,%.2f,%s",
+  snprintf(b, sizeof(b), "W1,STA,%lu,%d,%d,%d,%.2f,%s,%.1f,%d,%d",
            (unsigned long)++sSta,
            nmea::st.quality, nmea::st.satsView, nmea::st.satsUsed,
-           nmea::st.hdop, clk::srcTag());
+           nmea::st.hdop, clk::srcTag(),
+           integ::g.cusum, integ::g.slow ? 1 : 0, integ::g.gated ? 1 : 0);
   if (sendLine(b)) ++nSta;
 }
 
@@ -8584,6 +8845,32 @@ static void consoleKey(char c) {
                       gQuiet ? "ON" : "off", gQuiet ? "不打印" : "可打印");
         break;
       }
+      case 'y': {                        // ★ v1.14.11:GNSS 原始字节探针(hex + ASCII + 间隔)
+        // 用法:y            -> 9600 收 2 s
+        //       y 5000       -> 9600 收 5 s
+        //       y 3000 115200-> 临时按 115200 收 3 s(收完自动换回 9600)
+        char ln[28]; int n = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 150) {
+          if (conAvail()) {
+            int chi = conGet();
+            if (chi < 0) continue;
+            char ch = (char)chi;
+            if (ch == '\n') break;
+            if (ch != '\r' && n < (int)sizeof(ln) - 1) ln[n++] = ch;
+          }
+        }
+        ln[n] = 0;
+        unsigned long ms = 2000, baud = (unsigned long)GNSS_BAUD;
+        int got = sscanf(ln, "%lu %lu", &ms, &baud);
+        if (got < 1) ms = 2000;
+        if (ms < 200)   ms = 200;
+        if (ms > 10000) ms = 10000;
+        if (got < 2) baud = (unsigned long)GNSS_BAUD;
+        if (baud < 1200 || baud > 921600) baud = (unsigned long)GNSS_BAUD;
+        gnss::rawProbe((uint32_t)ms, (uint32_t)baud);
+        break;
+      }
       case 'u': {                        // ★ v1.14.0:时钟诊断(UTC 源 / DS3231 / 相位差)
         // 敲整行:"u" 打状态,"u sync" 立刻校一次钟。'u' 已读走,把行尾凑齐。
         char ln[12]; int n = 0;
@@ -8747,7 +9034,7 @@ static void serialReport(bool force) {
   char hb[12];
   if (integ::valid()) snprintf(hb, sizeof(hb), "%.0fm", integ::hpl());
   else                strcpy(hb, "---");
-  Serial.printf("[%lus] %s | sat %d/%d | hdop %.1f | cn0 %.0f | off %.0fm | hpl %s | pdop %.1f | gsa %lu | cus %.1f | mp %.1f | base %s | tune %d | cksumErr %lu | zda %lu | utc %s | bj %s | rst %s | boot %lu | loopMax %lums x%lu\n",
+  Serial.printf("[%lus] %s | sat %d/%d | hdop %.1f | cn0 %.0f | off %.0fm | hpl %s | pdop %.1f | gsa %lu | cus %.1f | mp %.1f | base %s | tune %d | cksumErr %lu | byte %lu | baud %lu | zda %lu | utc %s | bj %s | rst %s | boot %lu | loopMax %lums x%lu\n",
                 (unsigned long)(now / 1000),
                 judge::res.tag,
                 nmea::st.satsUsed, nmea::st.satsView, nmea::st.hdop,
@@ -8757,6 +9044,8 @@ static void serialReport(bool force) {
                 judge::baseSet ? "set" : "---",
                 tune::changed(),                         // ★ v1.10.0:几个参数不是出厂值
                 (unsigned long)nmea::st.badCksum,
+                (unsigned long)gnss::rawBytes(),
+                (unsigned long)gnss::curBaud,
                 (unsigned long)nmea::st.zdaCount,
                 utc, bj, gRstText,
                 (unsigned long)gRtc[kRtcBootSlot],
@@ -8901,16 +9190,16 @@ void setup() {
   Serial.printf("[bench] proto P%d\n", kProto);
   // ★ v1.6.0:横幅里的版本号**不写死** —— 用 `splash::kVer` 拼(C3 侧 v1.1.0 刚在
   //   实机上抓到同一处漂移:板上跑 v1.1.0、横幅还报 v1.0.3)。写死必漂,一律占位符。
-  Serial.printf("[bench] boot ok (%s: 链路协议号握手 —— 心跳 `@k ping P%d` 带号,C3 收到带号的 ping 时"
-                "本侧回 `@s ok proto P%d`;两边不一致只**告警不拒绝执行**(串口一行 + 给 C3 一条 txt 回执);"
-                "老 C3(不带号的 ping)时本侧保持沉默,行为与 v1.5.25 完全一致;协议号改动**两板必须同批烧**,"
-                "校验跑 tools/check_proto_sync.py;上一版 v1.5.25 的 TOUCH 自动重启见 docs/变更记录-S3.md)\n",
-                splash::kVer, (int)kProto, (int)kProto);
+  Serial.printf("[bench] boot ok (%s: WiFi 台账巡连失败后的后台自动重试 —— 失败后 30s 一轮、"
+                "连败 3 轮后 5min 一轮,连上为止;每轮失败照旧关射频还内存,动图页在场自动推迟;"
+                "自动轮给 C3 回执静音、人工 `w` 命令即撤;上一版 v1.14.12 的 CUSUM/σ 补丁见 docs/变更记录-S3.md)\n",
+                splash::kVer);
   printHelp();
 }
 
 void loop() {
   gnss::poll();             // 1 收(真实 UART)
+  gnss::baudHunt(millis()); // ★ v1.14.11:一直没有效报文就自动换波特率(详情见 kViableBauds)
   nmea::drain();            // 2 解
   judge::update();          // 3 判
   sht::poll();              // 4 环境温湿度(内部自己按 2 秒节流)
