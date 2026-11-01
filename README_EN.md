@@ -8,6 +8,13 @@ This is not another "it can get a fix" GPS module demo — it computes the error
 
 > The hardware is off-the-shelf modules. The software is where all the value of this bench lives.
 
+![PC-side live dashboard overview](docs/images/dashboard-hero.png)
+
+*PC dashboard (indoor window-side test run): 19/24 satellites tracked, and the 88.3 m position
+offset is immediately flagged `POS-ANOMALY` with an alarm — this is not a malfunction, it is the
+integrity monitor doing its job: the antenna was moved to the window while the surveyed base
+coordinate stayed at the bench, and the offset is reported honestly.*
+
 ---
 
 ## 1. The problem it solves
@@ -144,6 +151,11 @@ and C/N0 sonification.
 and each picked satellite sounds its own C/N0 — **a strike only when the pitch changes** (bell / glass / wood),
 up to eight voices. A strong, steady satellite strikes once every ten seconds or so; a weak low-elevation
 one sounds like rain. Everything is synthesised in-page with Web Audio.
+
+![Sky dome: picked satellites carry a breathing halo and a ♪ badge](docs/images/sky-sonify.gif)
+*Sky dome: the ♪ badge and breathing halo mark "who is singing"; the side curtains are the GPS / BDS C/N0 bars.*
+
+![Panel 08: active voices and the 24 s trend](docs/images/panel-08.png)
 
 The service has zero third-party dependencies (Python standard library only). `python dashboard.py`
 serves on 8787 and the page polls `/api/live` every 2 s. See [`tools/dashboard/README.md`](tools/dashboard/README.md).
